@@ -1,0 +1,9 @@
+---
+# Google style with a 100-column limit.
+# Pointer alignment is fixed instead of derived from the file, so every file
+# is formatted the same way no matter what it already contains.
+BasedOnStyle: Google
+ColumnLimit: 100
+DerivePointerAlignment: false
+PointerAlignment: Left
+...

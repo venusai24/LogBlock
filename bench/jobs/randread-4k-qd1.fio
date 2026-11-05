@@ -1,0 +1,12 @@
+; 4K random reads at queue depth 1 over 256M of already written data.
+; Fixed size, not fixed time, so the log stays bounded (bench-output contract).
+; direct=1 skips only the client page cache; no FLUSH is sent, so durability
+; cost is not measured.
+[randread-4k-qd1]
+filename=/dev/nbd0
+ioengine=libaio
+direct=1
+rw=randread
+bs=4k
+size=256M
+iodepth=1

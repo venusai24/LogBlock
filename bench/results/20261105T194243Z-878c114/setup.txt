@@ -1,0 +1,14 @@
+date_utc: 2026-11-05T19:42:43Z
+cpu: 13th Gen Intel(R) Core(TM) i7-1360P
+ram: 16039612 kB
+kernel: 6.19.10-300.fc44.x86_64
+data_dir: <dir>/logblock-data
+filesystem_device: /dev/nvme0n1p8[/home] btrfs
+nbdkit: nbdkit 1.48.1 (nbdkit-1.48.1-1.fc44)
+fio: fio-3.40
+git_sha: 878c114c61e7a8b05797a2c77c6a9458dcae3172
+git_tree: DIRTY (uncommitted changes; the SHA does not describe this build)
+build_type: Release
+logblock_cap: 3G
+runs_per_job: 3
+note: git_tree DIRTY above is a script bug (the results folder it had just created counted as an uncommitted change). Before the run, git status showed no other changes. Fixed in scripts/bench.sh after this run; the data is unchanged.

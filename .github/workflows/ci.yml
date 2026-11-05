@@ -1,0 +1,36 @@
+# CI runs the same script as a local check, so the two can never drift apart.
+# scripts/check.sh must stay the only test command here: anything added to it,
+# including the crash test, then runs on every push.
+#
+# This workflow does not run until the repository has a remote.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Same distribution as the dev machine (Fedora 44).
+    container: fedora:44
+    steps:
+      # Only what the build and the rootless tests need, not the whole
+      # development package list: no fio, perf, valgrind, nbd-client or other root-only
+      # tools. python3 is for the benchmark script's test.
+      - name: Install packages
+        run: |
+          dnf install -y \
+            gcc-c++ cmake ninja-build git pkgconf-pkg-config \
+            nbdkit nbdkit-devel libnbd-devel \
+            gtest-devel spdlog-devel fmt-devel google-crc32c-devel \
+            libasan libubsan libtsan \
+            python3 findutils procps-ng
+
+      - uses: actions/checkout@v4
+
+      - name: Build and test
+        run: scripts/check.sh

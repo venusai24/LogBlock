@@ -1,0 +1,16 @@
+---
+# Trailing return types are a style choice this
+# project does not use, so that one modernize check is off.
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  clang-analyzer-*,
+  -modernize-use-trailing-return-type
+# Only report problems in our own headers, not in nbdkit, spdlog or GoogleTest.
+HeaderFilterRegex: '.*/(include|src)/.*'
+# Findings are warnings, so a stricter check never blocks a build. The cleanup
+# pass works through them.
+WarningsAsErrors: ''
+...

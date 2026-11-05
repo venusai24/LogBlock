@@ -1,0 +1,12 @@
+; 128K sequential reads at queue depth 1 over 1G of already written data.
+; Fixed size, not fixed time, so the log stays bounded (bench-output contract).
+; direct=1 skips only the client page cache; no FLUSH is sent, so durability
+; cost is not measured.
+[read-128k-qd1]
+filename=/dev/nbd0
+ioengine=libaio
+direct=1
+rw=read
+bs=128k
+size=1G
+iodepth=1

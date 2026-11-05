@@ -1,0 +1,18 @@
+# Tests inherit the root checks, minus style checks that add noise to test code
+#. Production code under src/ keeps them.
+#  - designated initializers, c arrays, ranges: style only
+#  - easily-swappable-parameters: test helpers take (offset, len)-style pairs by design
+#  - invalid-enum-default-initialization: tests build records with zero-initialised headers
+#  - unchecked-optional-access: ASSERT_TRUE(opt) precedes the access, which tidy cannot see
+#  - random-generator-seed: a constant seed is the point (reproducible tests)
+InheritParentConfig: true
+Checks: >
+  -modernize-use-designated-initializers,
+  -modernize-avoid-c-arrays,
+  -modernize-use-ranges,
+  -modernize-use-nodiscard,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-invalid-enum-default-initialization,
+  -bugprone-unchecked-optional-access,
+  -bugprone-random-generator-seed,
+  -bugprone-inc-dec-in-conditions
