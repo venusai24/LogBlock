@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "logblock/io.h"
+#include "support/io_helpers.h"
 
 namespace logblock {
 namespace {
@@ -205,21 +206,23 @@ class PosixIoTest : public ::testing::Test {
   std::unique_ptr<Io> io_;
 };
 
-TEST_F(PosixIoTest, OpenCreatesAMissingFileWithMode0600) {
-  ASSERT_FALSE(fs::exists(path_));
-  ASSERT_TRUE(io_->open_log(path_).ok());
-  struct stat st{};
-  ASSERT_EQ(stat(path_.c_str(), &st), 0);
-  EXPECT_EQ(st.st_mode & 0777, 0600U);
-  EXPECT_EQ(size(), 0U);
+// --- open_log_existing and create_log (T042 ruling a; OWNER: human implements them) -------------
+
+TEST_F(PosixIoTest, OpenExistingOnAMissingFileFindsNothingAndCreatesNothing) {
+  bool found = true;
+  ASSERT_TRUE(io_->open_log_existing(path_, &found).ok());
+  EXPECT_FALSE(found);
+  EXPECT_FALSE(fs::exists(path_)) << "open_log_existing must not use O_CREAT";
 }
 
-TEST_F(PosixIoTest, OpenLeavesAnExistingFileUnchanged) {
+TEST_F(PosixIoTest, OpenExistingOnAnExistingFileOpensItWithoutChangingIt) {
   {
     std::ofstream f(path_, std::ios::binary);
     f << "hello";
   }
-  ASSERT_TRUE(io_->open_log(path_).ok());
+  bool found = false;
+  ASSERT_TRUE(io_->open_log_existing(path_, &found).ok());
+  EXPECT_TRUE(found);
   EXPECT_EQ(size(), 5U);
   char buf[5];
   size_t got = 0;
@@ -227,20 +230,68 @@ TEST_F(PosixIoTest, OpenLeavesAnExistingFileUnchanged) {
   EXPECT_EQ(std::string(buf, got), "hello");
 }
 
-TEST_F(PosixIoTest, OpenFailsWhenTheDirectoryIsMissing) {
-  std::string bad = (dir_ / "no-such-dir" / "log").string();
-  Status s = io_->open_log(bad);
+TEST_F(PosixIoTest, OpenExistingWithAMissingDirectoryIsNotFoundToo) {
+  // ENOENT covers a missing parent directory as well; the later create then fails with its own
+  // error, naming the path.
+  bool found = true;
+  ASSERT_TRUE(io_->open_log_existing((dir_ / "no-such-dir" / "log").string(), &found).ok());
+  EXPECT_FALSE(found);
+}
+
+TEST_F(PosixIoTest, OpenExistingOnADirectoryIsAnErrorNotNotFound) {
+  bool found = true;
+  Status s = io_->open_log_existing(dir_.string(), &found);
+  EXPECT_FALSE(s.ok()) << "only ENOENT means 'not there'";
+  EXPECT_FALSE(found);
+  EXPECT_TRUE(contains(s.message(), dir_.string())) << s.message();
+}
+
+TEST_F(PosixIoTest, OpenExistingTwiceIsAnError) {
+  { std::ofstream f(path_, std::ios::binary); }
+  bool found = false;
+  ASSERT_TRUE(io_->open_log_existing(path_, &found).ok());
+  EXPECT_EQ(io_->open_log_existing(path_, &found).code(), StatusCode::IoError);
+}
+
+TEST_F(PosixIoTest, CreateLogMakesANewFileWithMode0600AndOpensIt) {
+  bool created = false;
+  ASSERT_TRUE(io_->create_log(path_, &created).ok());
+  EXPECT_TRUE(created);
+  struct stat st{};
+  ASSERT_EQ(stat(path_.c_str(), &st), 0);
+  EXPECT_EQ(st.st_mode & 0777, 0600U);
+  EXPECT_EQ(size(), 0U) << "the file is open and empty";
+}
+
+TEST_F(PosixIoTest, CreateLogOnAnExistingFileLosesWithoutTouchingIt) {
+  {
+    std::ofstream f(path_, std::ios::binary);
+    f << "hello";
+  }
+  bool created = true;
+  ASSERT_TRUE(io_->create_log(path_, &created).ok()) << "O_EXCL losing is a result, not an error";
+  EXPECT_FALSE(created);
+  EXPECT_EQ(fs::file_size(path_), 5U) << "an existing log is never truncated";
+  uint64_t n = 0;
+  EXPECT_FALSE(io_->file_size(&n).ok()) << "nothing was opened by the losing create";
+}
+
+TEST_F(PosixIoTest, CreateLogWithAMissingDirectoryFailsNamingThePath) {
+  const std::string bad = (dir_ / "no-such-dir" / "log").string();
+  bool created = true;
+  Status s = io_->create_log(bad, &created);
   EXPECT_EQ(s.code(), StatusCode::IoError);
+  EXPECT_FALSE(created);
   EXPECT_TRUE(contains(s.message(), bad)) << s.message();
 }
 
 TEST_F(PosixIoTest, OpeningTwiceIsAnError) {
-  ASSERT_TRUE(io_->open_log(path_).ok());
-  EXPECT_EQ(io_->open_log(path_).code(), StatusCode::IoError);
+  ASSERT_TRUE(test::open_or_create_log(*io_, path_).ok());
+  EXPECT_EQ(test::open_or_create_log(*io_, path_).code(), StatusCode::IoError);
 }
 
 TEST_F(PosixIoTest, WriteThenReadBackAtAnExplicitOffset) {
-  ASSERT_TRUE(io_->open_log(path_).ok());
+  ASSERT_TRUE(test::open_or_create_log(*io_, path_).ok());
   std::string data = bytes(4096, 'a');
   ASSERT_TRUE(io_->pwrite(40, data.data(), data.size()).ok());
   EXPECT_EQ(size(), 40U + 4096U);
@@ -253,7 +304,7 @@ TEST_F(PosixIoTest, WriteThenReadBackAtAnExplicitOffset) {
 }
 
 TEST_F(PosixIoTest, PreadPastTheEndReportsAShortRead) {
-  ASSERT_TRUE(io_->open_log(path_).ok());
+  ASSERT_TRUE(test::open_or_create_log(*io_, path_).ok());
   std::string data = bytes(10, 'a');
   ASSERT_TRUE(io_->pwrite(0, data.data(), data.size()).ok());
 
@@ -266,7 +317,7 @@ TEST_F(PosixIoTest, PreadPastTheEndReportsAShortRead) {
 }
 
 TEST_F(PosixIoTest, FtruncateShrinksTheFile) {
-  ASSERT_TRUE(io_->open_log(path_).ok());
+  ASSERT_TRUE(test::open_or_create_log(*io_, path_).ok());
   std::string data = bytes(100, 'a');
   ASSERT_TRUE(io_->pwrite(0, data.data(), data.size()).ok());
   ASSERT_TRUE(io_->ftruncate(60).ok());
@@ -274,7 +325,7 @@ TEST_F(PosixIoTest, FtruncateShrinksTheFile) {
 }
 
 TEST_F(PosixIoTest, FsyncAndParentDirectoryFsyncSucceed) {
-  ASSERT_TRUE(io_->open_log(path_).ok());
+  ASSERT_TRUE(test::open_or_create_log(*io_, path_).ok());
   std::string data = bytes(10, 'a');
   ASSERT_TRUE(io_->pwrite(0, data.data(), data.size()).ok());
   EXPECT_TRUE(io_->fsync().ok());
@@ -291,6 +342,175 @@ TEST_F(PosixIoTest, EveryCallBeforeOpenIsAnError) {
   EXPECT_EQ(io_->fsync().code(), StatusCode::IoError);
   EXPECT_EQ(io_->ftruncate(0).code(), StatusCode::IoError);
   EXPECT_EQ(io_->fsync_parent_dir().code(), StatusCode::IoError);
+}
+
+// --- M2 additions: lock_log and the checkpoint file -----------------
+
+class PosixIoLockTest : public PosixIoTest {};
+
+TEST_F(PosixIoLockTest, SecondOpenFileDescriptionOnTheSameLogIsRefusedWithoutBlocking) {
+  ASSERT_TRUE(test::open_or_create_log(*io_, path_).ok());
+  ASSERT_TRUE(io_->lock_log().ok());
+
+  // A separate Io is a separate open file description, which is what flock locks on.
+  auto other = make_posix_io();
+  ASSERT_TRUE(test::open_or_create_log(*other, path_).ok());
+  Status s = other->lock_log();  // LOCK_NB: returns at once instead of waiting
+  EXPECT_EQ(s.code(), StatusCode::Failed) << s.to_string();
+  EXPECT_TRUE(contains(s.message(), path_)) << s.message();
+}
+
+TEST_F(PosixIoLockTest, ClosingTheHolderReleasesTheLock) {
+  ASSERT_TRUE(test::open_or_create_log(*io_, path_).ok());
+  ASSERT_TRUE(io_->lock_log().ok());
+  io_.reset();  // closes the descriptor
+
+  auto other = make_posix_io();
+  ASSERT_TRUE(test::open_or_create_log(*other, path_).ok());
+  EXPECT_TRUE(other->lock_log().ok());
+}
+
+TEST_F(PosixIoLockTest, LockingDoesNotChangeTheFile) {
+  {
+    std::ofstream f(path_, std::ios::binary);
+    f << "hello";
+  }
+  ASSERT_TRUE(test::open_or_create_log(*io_, path_).ok());
+  ASSERT_TRUE(io_->lock_log().ok());
+  EXPECT_EQ(size(), 5U);
+}
+
+class PosixIoCkptTest : public PosixIoTest {
+ protected:
+  void SetUp() override {
+    PosixIoTest::SetUp();
+    ckpt_path_ = path_ + ".ckpt";
+  }
+  std::string ckpt_path_;
+};
+
+TEST_F(PosixIoCkptTest, OpenWithoutCreateOnADirectoryIsAnErrorNamingThePathAndTheOsError) {
+  // D34: only ENOENT means "no checkpoint file". Anything else is an error the caller refuses on,
+  // so the message must carry the path and the OS's reason.
+  fs::create_directory(ckpt_path_);
+  bool opened = true;
+  bool created = true;
+  Status s = io_->open_ckpt(ckpt_path_, /*create=*/false, &opened, &created);
+  EXPECT_EQ(s.code(), StatusCode::IoError);
+  EXPECT_FALSE(opened);
+  EXPECT_TRUE(contains(s.message(), ckpt_path_)) << s.message();
+  EXPECT_TRUE(contains(s.message(), "Is a directory")) << s.message();
+}
+
+TEST_F(PosixIoCkptTest, OpenWithoutCreateOnAMissingFileSucceedsWithOpenedFalse) {
+  bool opened = true;
+  bool created = true;
+  ASSERT_TRUE(io_->open_ckpt(ckpt_path_, /*create=*/false, &opened, &created).ok());
+  EXPECT_FALSE(opened);
+  EXPECT_FALSE(created);
+  EXPECT_FALSE(fs::exists(ckpt_path_)) << "create = false must not create the file";
+}
+
+TEST_F(PosixIoCkptTest, OpenWithCreateMakesAMode0600FileAndReportsItWasNew) {
+  bool opened = false;
+  bool created = false;
+  ASSERT_TRUE(io_->open_ckpt(ckpt_path_, /*create=*/true, &opened, &created).ok());
+  EXPECT_TRUE(opened);
+  EXPECT_TRUE(created);
+  struct stat st{};
+  ASSERT_EQ(stat(ckpt_path_.c_str(), &st), 0);
+  EXPECT_EQ(st.st_mode & 0777, 0600U);
+}
+
+TEST_F(PosixIoCkptTest, OpenWithCreateOnAnExistingFileKeepsItAndReportsNotNew) {
+  {
+    std::ofstream f(ckpt_path_, std::ios::binary);
+    f << "slot";
+  }
+  bool opened = false;
+  bool created = true;
+  ASSERT_TRUE(io_->open_ckpt(ckpt_path_, /*create=*/true, &opened, &created).ok());
+  EXPECT_TRUE(opened);
+  EXPECT_FALSE(created);
+  uint64_t n = 0;
+  ASSERT_TRUE(io_->ckpt_size(&n).ok());
+  EXPECT_EQ(n, 4U);
+}
+
+TEST_F(PosixIoCkptTest, OpenWithoutCreateOnAnExistingFileOpensIt) {
+  {
+    std::ofstream f(ckpt_path_, std::ios::binary);
+    f << "slot";
+  }
+  bool opened = false;
+  bool created = true;
+  ASSERT_TRUE(io_->open_ckpt(ckpt_path_, /*create=*/false, &opened, &created).ok());
+  EXPECT_TRUE(opened);
+  EXPECT_FALSE(created);
+}
+
+TEST_F(PosixIoCkptTest, OpeningTwiceIsAnError) {
+  bool opened = false;
+  bool created = false;
+  ASSERT_TRUE(io_->open_ckpt(ckpt_path_, true, &opened, &created).ok());
+  EXPECT_EQ(io_->open_ckpt(ckpt_path_, true, &opened, &created).code(), StatusCode::IoError);
+}
+
+TEST_F(PosixIoCkptTest, OpenFailsWhenTheDirectoryIsMissing) {
+  bool opened = true;
+  bool created = true;
+  std::string bad = (dir_ / "no-such-dir" / "log.ckpt").string();
+  Status s = io_->open_ckpt(bad, /*create=*/true, &opened, &created);
+  EXPECT_EQ(s.code(), StatusCode::IoError);
+  EXPECT_TRUE(contains(s.message(), bad)) << s.message();
+  EXPECT_FALSE(opened);
+}
+
+TEST_F(PosixIoCkptTest, WriteReadSizeAndFsyncWorkOnTheCheckpointFile) {
+  bool opened = false;
+  bool created = false;
+  ASSERT_TRUE(io_->open_ckpt(ckpt_path_, true, &opened, &created).ok());
+  std::string data = bytes(300, 'a');
+  ASSERT_TRUE(io_->ckpt_pwrite(20, data.data(), data.size()).ok());
+  EXPECT_TRUE(io_->ckpt_fsync().ok());
+
+  uint64_t n = 0;
+  ASSERT_TRUE(io_->ckpt_size(&n).ok());
+  EXPECT_EQ(n, 320U);
+
+  std::string back(400, '?');
+  size_t got = 0;
+  ASSERT_TRUE(io_->ckpt_pread(20, back.data(), back.size(), &got).ok());
+  EXPECT_EQ(got, 300U) << "a read past the end is short, like pread";
+  EXPECT_EQ(back.substr(0, got), data);
+}
+
+TEST_F(PosixIoCkptTest, CheckpointCallsAreIndependentOfTheLog) {
+  // The log is never opened here: the checkpoint file has its own descriptor.
+  bool opened = false;
+  bool created = false;
+  ASSERT_TRUE(io_->open_ckpt(ckpt_path_, true, &opened, &created).ok());
+  std::string data = bytes(8, 'a');
+  EXPECT_TRUE(io_->ckpt_pwrite(0, data.data(), data.size()).ok());
+  uint64_t n = 0;
+  EXPECT_EQ(io_->file_size(&n).code(), StatusCode::IoError) << "the log is still not open";
+}
+
+TEST_F(PosixIoCkptTest, EveryCheckpointCallBeforeItsOpenIsAnError) {
+  char buf[4] = {};
+  size_t got = 0;
+  uint64_t n = 0;
+  EXPECT_EQ(io_->ckpt_size(&n).code(), StatusCode::IoError);
+  EXPECT_EQ(io_->ckpt_pread(0, buf, 4, &got).code(), StatusCode::IoError);
+  EXPECT_EQ(io_->ckpt_pwrite(0, buf, 4).code(), StatusCode::IoError);
+  EXPECT_EQ(io_->ckpt_fsync().code(), StatusCode::IoError);
+  // Opening the log does not open the checkpoint file.
+  ASSERT_TRUE(test::open_or_create_log(*io_, path_).ok());
+  EXPECT_EQ(io_->ckpt_fsync().code(), StatusCode::IoError);
+}
+
+TEST_F(PosixIoLockTest, LockBeforeOpenIsAnError) {
+  EXPECT_EQ(io_->lock_log().code(), StatusCode::IoError);
 }
 
 }  // namespace

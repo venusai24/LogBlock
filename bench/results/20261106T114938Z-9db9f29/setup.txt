@@ -1,0 +1,16 @@
+date_utc: 2026-11-06T11:49:38Z
+modes: baseline
+cpu: 13th Gen Intel(R) Core(TM) i7-1360P
+ram: 16039632 kB
+kernel: 6.19.10-300.fc44.x86_64
+data_dir: /home/venusai/Dev/miniHCI/LogBlock/bench-data
+filesystem_device: /dev/nvme0n1p8[/home] btrfs
+nbdkit: nbdkit 1.48.1 (nbdkit-1.48.1-1.fc44)
+fio: fio-3.40
+git_sha: 9db9f2981afc2e1218373061801216ce6e86db0f
+git_tree: clean
+build_type: Release
+baseline_fio_engine: libaio on /dev/nbd0 (direct=1, nbd-client, 4096-byte blocks)
+baseline_cache_handling: sudo tee /proc/sys/vm/drop_caches (3) after the prefill, before each job
+logblock_cap: 3G
+runs_per_job: 3

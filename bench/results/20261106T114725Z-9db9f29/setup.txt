@@ -1,0 +1,17 @@
+date_utc: 2026-11-06T11:47:25Z
+modes: recovery
+cpu: 13th Gen Intel(R) Core(TM) i7-1360P
+ram: 16039632 kB
+kernel: 6.19.10-300.fc44.x86_64
+data_dir: /home/venusai/Dev/miniHCI/LogBlock/bench-data
+filesystem_device: /dev/nvme0n1p8[/home] btrfs
+nbdkit: nbdkit 1.48.1 (nbdkit-1.48.1-1.fc44)
+fio: fio-3.40
+git_sha: 9db9f2981afc2e1218373061801216ce6e86db0f
+git_tree: clean
+build_type: Release
+recovery_fio_engine: nbd (4K random writes, iodepth 32, over the Unix socket; builds the log)
+recovery_checkpoint_interval: default (67108864 bytes)
+recovery_log_targets_bytes: 104857600 1073741824
+recovery_cache_handling: no root; fsync then posix_fadvise(DONTNEED) on the log and .ckpt before each run; verified with fincore when available; the disk's own cache is not dropped
+recovery_runs_per_mode: 3

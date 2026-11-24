@@ -13,6 +13,7 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -36,7 +37,22 @@ std::string g_log_path;
 uint64_t g_cap = 0;
 bool g_have_log = false;
 bool g_have_cap = false;
+uint64_t g_checkpoint_interval = logblock::kDefaultCheckpointInterval;
 std::unique_ptr<Engine> g_engine;
+
+// One logger for the whole plugin, on the stderr sink (spdlog's default logger
+// writes to stdout). It is shared by startup (the recovery report) and
+// logblock_unload (the counters) because spdlog throws if the same logger name
+// is registered twice.
+std::shared_ptr<spdlog::logger> g_logger;
+
+spdlog::logger& logger() {
+  if (!g_logger) {
+    g_logger = spdlog::stderr_logger_st("logblock");
+    g_logger->set_pattern("[%l] %v");
+  }
+  return *g_logger;
+}
 
 // Plain integers are enough: with SERIALIZE_CONNECTIONS nbdkit runs one request at
 // a time, so no two threads ever touch these at once.
@@ -76,6 +92,16 @@ int report(const Status& status) {
   return -1;
 }
 
+// Prints the warnings the engine raised while serving (a failed checkpoint), once each. The
+// request that triggered a failed checkpoint still succeeds, so this is the only place the
+// operator hears about it (D27).
+void log_engine_warnings() {
+  for (const std::string& warning : g_engine->take_warnings()) {
+    logger().warn("{}", warning);
+  }
+  logger().flush();
+}
+
 // Runs `body` (which returns a Status) and never lets an exception escape into
 // nbdkit's C code, where it would be undefined behaviour.
 // An unexpected exception becomes EIO. Calls `on_ok` only when the request worked,
@@ -87,6 +113,7 @@ int run(Body body, OnOk on_ok) {
     if (status.ok()) {
       on_ok();
     }
+    log_engine_warnings();  // a checkpoint that failed during this request
     return report(status);
   } catch (const std::exception& e) {
     nbdkit_error("unexpected exception: %s", e.what());
@@ -102,7 +129,14 @@ int run(Body body, OnOk on_ok) {
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): the signature is fixed by nbdkit.
 int logblock_config(const char* key, const char* value) {
   if (std::strcmp(key, "log") == 0) {
-    g_log_path = value;
+    // Made absolute now: a daemonized nbdkit changes directory to "/" after get_ready, and the
+    // checkpoint file is created later by path, next to the log.
+    char* absolute = nbdkit_absolute_path(value);
+    if (absolute == nullptr) {
+      return -1;  // nbdkit has reported the reason
+    }
+    g_log_path = absolute;
+    std::free(absolute);
     g_have_log = true;
   } else if (std::strcmp(key, "cap") == 0) {
     // nbdkit_parse_size understands suffixes like 1M and 2G. It reports its own
@@ -115,8 +149,18 @@ int logblock_config(const char* key, const char* value) {
     }
     g_cap = static_cast<uint64_t>(size);
     g_have_cap = true;
+  } else if (std::strcmp(key, "checkpoint_interval") == 0) {
+    const int64_t size = nbdkit_parse_size(value);
+    if (size < 0) {
+      nbdkit_error("invalid value '%s' for the checkpoint_interval setting", value);
+      return -1;
+    }
+    g_checkpoint_interval = static_cast<uint64_t>(size);
   } else {
-    nbdkit_error("unknown setting '%s' (the settings are log=<path> and cap=<size>)", key);
+    nbdkit_error(
+        "unknown setting '%s' (the settings are log=<path>, cap=<size> and "
+        "checkpoint_interval=<size>)",
+        key);
     return -1;
   }
   return 0;
@@ -137,20 +181,52 @@ int logblock_config_complete() {
                  static_cast<unsigned long long>(logblock::kDataRecordSize));
     return -1;
   }
+  if (g_checkpoint_interval < logblock::kMinCheckpointInterval) {
+    nbdkit_error("the checkpoint_interval setting is too small: %llu bytes, the minimum is %llu",
+                 static_cast<unsigned long long>(g_checkpoint_interval),
+                 static_cast<unsigned long long>(logblock::kMinCheckpointInterval));
+    return -1;
+  }
   return 0;
 }
 
-// get_ready runs before nbdkit forks into the background, so a refusal here
-// (non-empty log, unopenable log) still reaches the terminal and the exit status
-//. Engine::create also creates the log file.
+// Prints how startup went (FR-023): the recovery line, then each warning. The format
+// is fixed by specs/002-crash-recovery/contracts/plugin-cli.md.
+void log_recovery_report(const std::string& log_path, const logblock::RecoveryReport& report) {
+  const char* source = "none";
+  if (report.source == logblock::RecoverySource::Checkpoint) {
+    source = "checkpoint";
+  } else if (report.source == logblock::RecoverySource::FullScan) {
+    source = "full_scan";
+  }
+  logger().info(
+      "recovery log={} source={} slot={} generation={} records_replayed={} "
+      "log_bytes_scanned={} torn_bytes_removed={} unreadable_checkpoints={} time_us={}",
+      log_path, source, report.slot, report.generation, report.records_replayed,
+      report.log_bytes_scanned, report.torn_bytes_removed, report.unreadable_checkpoints,
+      report.time_us);
+  for (const std::string& warning : report.warnings) {
+    logger().warn("{}", warning);
+  }
+  logger().flush();
+}
+
+// get_ready runs before nbdkit forks into the background and before it creates the
+// socket. Engine::create recovers the log inside this call, so no client can connect
+// until recovery is done (FR-004), and a refusal (corrupt log, lock held, unopenable
+// log) still reaches the terminal and the exit status. Engine::create also creates
+// the log file if it is missing.
 int logblock_get_ready() {
   try {
-    const Status status = Engine::create(g_log_path, g_cap, logblock::make_posix_io(), &g_engine);
+    const Status status = Engine::create(g_log_path, g_cap, logblock::make_posix_io(), &g_engine,
+                                         g_checkpoint_interval);
     if (!status.ok()) {
       // The engine's text already names the log and the reason.
       nbdkit_error("%s", status.message().c_str());
       return -1;
     }
+    log_recovery_report(g_log_path, g_engine->recovery_report());
+    log_engine_warnings();  // the fresh checkpoint at startup may have failed (FR-016)
     return 0;
   } catch (const std::exception& e) {
     nbdkit_error("cannot create the engine: %s", e.what());
@@ -161,19 +237,22 @@ int logblock_get_ready() {
 }
 
 // nbdkit calls unload on a clean shutdown (SIGTERM, SIGINT, or the last client
-// leaving). The counters go out as one structured line on stderr: spdlog's default
-// logger writes to stdout, so build a logger on the stderr sink.
+// leaving). The counters go out as one structured line on stderr, through the same
+// logger as the recovery report.
 void logblock_unload() {
   if (!g_engine) {
     return;  // startup was refused: there is nothing to report
   }
   try {
-    auto logger = spdlog::stderr_logger_st("logblock");
-    logger->set_pattern("[%l] %v");
-    logger->info("counters reads={} writes={} trims={} flushes={} bytes_logged={}",
-                 g_counters.reads, g_counters.writes, g_counters.trims, g_counters.flushes,
-                 g_engine->bytes_logged());
-    logger->flush();
+    const logblock::CheckpointCounters c = g_engine->checkpoint_counters();
+    logger().info(
+        "counters reads={} writes={} trims={} flushes={} bytes_logged={} checkpoints_written={} "
+        "checkpoints_failed={} checkpoints_unreadable={} checkpoint_duration_count={} "
+        "checkpoint_duration_max_us={} checkpoint_duration_sum_us={}",
+        g_counters.reads, g_counters.writes, g_counters.trims, g_counters.flushes,
+        g_engine->bytes_logged(), c.written, c.failed, c.unreadable, c.duration_count,
+        c.duration_max_us, c.duration_sum_us);
+    logger().flush();
   } catch (...) {  // NOLINT(bugprone-empty-catch)
     // Nothing useful can be done while shutting down.
   }
@@ -222,8 +301,10 @@ nbdkit_plugin create_plugin() {
   plugin.config = logblock_config;
   plugin.config_complete = logblock_config_complete;
   plugin.config_help =
-      "log=<path>   Log file (created if missing, must be empty)\n"
-      "cap=<size>   Maximum log size, at least 4136 (for example 2G)";
+      "log=<path>   Log file (created if missing, recovered if not empty)\n"
+      "cap=<size>   Maximum log size, at least 4136 (for example 2G)\n"
+      "checkpoint_interval=<size>\n"
+      "             Log growth between checkpoints, at least 4136 (default 64M)";
   plugin.get_ready = logblock_get_ready;
   plugin.unload = logblock_unload;
   plugin.open = logblock_open;

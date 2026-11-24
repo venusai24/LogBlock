@@ -3,9 +3,11 @@
 add_executable(integration_tests
   harness.cc
   startup_test.cc
+  lock_test.cc
   nbd_io_test.cc
   counters_test.cc
-  zero_test.cc)
+  zero_test.cc
+  recovery_test.cc)
 # logblock_core is linked only for the record-size constants in logblock/engine.h.
 # The tests never call the engine; they talk to the plugin over NBD.
 target_link_libraries(integration_tests PRIVATE

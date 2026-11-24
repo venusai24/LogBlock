@@ -1,0 +1,16 @@
+; 4K random writes at queue depth 32 over the nbd engine, for the latency-across-a-
+; checkpoint measurement (scripts/bench.sh --only latency). Not a baseline job.
+; Fixed count of I/Os, not fixed time: LAT_WRITES writes must pass the first
+; checkpoint boundary and stay short of the second.
+; write_lat_log with no log_avg_msec gives one row per I/O (checked on fio 3.40).
+; No fsync options: no FLUSH is sent, so the checkpoint has the most to write.
+; scripts/bench.sh sets NBD_URI, LAT_WRITES and LAT_LOG; fio expands ${VAR}.
+[randwrite-4k-qd32-ckpt]
+ioengine=nbd
+uri=${NBD_URI}
+rw=randwrite
+bs=4k
+size=128M
+iodepth=32
+number_ios=${LAT_WRITES}
+write_lat_log=${LAT_LOG}

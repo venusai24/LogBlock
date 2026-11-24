@@ -19,15 +19,21 @@ namespace logblock {
 
 class LogFile {
  public:
-  // Works on a log that is empty and already open. M1 refuses a non-empty log at
-  // startup, so appends always begin at offset 0 with seq 1.
+  // Works on a log that is empty and already open: appends begin at offset 0 with seq 1.
   explicit LogFile(Io& io) : io_(io) {}
+
+  // Resumes an existing log (used by recovery). Precondition: the log file is open, its
+  // first `end` bytes are valid records, nothing valid lies past `end` (recovery has cut
+  // any torn tail), and `next_seq` is the seq the next record gets: the last record's
+  // seq + 1, or 1 when end == 0 (so next_seq >= 1). The next append lands at `end`,
+  // and a failed append is cut back to `end`.
+  LogFile(Io& io, uint64_t end, uint64_t next_seq) : io_(io), end_(end), next_seq_(next_seq) {}
 
   // The offset just past the last complete record, which is also the number of
   // bytes in the log's records. Advances only after an append fully succeeds.
   [[nodiscard]] uint64_t end() const { return end_; }
 
-  // The seq the next record will get. Starts at 1 and advances with end().
+  // The seq the next record will get. Starts at 1 (or at the resumed value) and advances with end().
   [[nodiscard]] uint64_t next_seq() const { return next_seq_; }
 
   // Appends one DATA record for `block_no` at end(), as a single pwrite. On

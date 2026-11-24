@@ -2,7 +2,7 @@ date_utc: 2026-11-05T19:42:43Z
 cpu: 13th Gen Intel(R) Core(TM) i7-1360P
 ram: 16039612 kB
 kernel: 6.19.10-300.fc44.x86_64
-data_dir: <dir>/logblock-data
+data_dir: /home/venusai/Dev/miniHCI/logblock-data
 filesystem_device: /dev/nvme0n1p8[/home] btrfs
 nbdkit: nbdkit 1.48.1 (nbdkit-1.48.1-1.fc44)
 fio: fio-3.40

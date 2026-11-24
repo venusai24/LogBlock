@@ -1,0 +1,2 @@
+[info] recovery log=/home/venusai/Dev/miniHCI/LogBlock/bench-data/logblock-bench.j0Ha5u/log.bin source=none slot=- generation=0 records_replayed=0 log_bytes_scanned=0 torn_bytes_removed=0 unreadable_checkpoints=0 time_us=1250
+[info] counters reads=0 writes=24000 trims=0 flushes=0 bytes_logged=99264000 checkpoints_written=1 checkpoints_failed=0 checkpoints_unreadable=0 checkpoint_duration_count=1 checkpoint_duration_max_us=35427 checkpoint_duration_sum_us=35427

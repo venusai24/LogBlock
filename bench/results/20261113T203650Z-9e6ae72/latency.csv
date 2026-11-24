@@ -1,0 +1,7 @@
+window,run,iodepth,window_writes,write_lat_p99_us,write_lat_max_us,checkpoint_duration_us
+boundary,1,32,1000,40094.9,40192.6,39840
+control,1,32,1000,184.3,187.3,
+boundary,2,32,1000,28328.4,28355.1,28056
+control,2,32,1000,173.3,193.0,
+boundary,3,32,1000,25216.8,25228.9,25007
+control,3,32,1000,275.4,277.4,

@@ -7,6 +7,10 @@
 #   build-asan  Debug, AddressSanitizer + UBSan: all tests (integration with LD_PRELOAD)
 #   build-tsan  Debug, ThreadSanitizer: unit tests only
 #
+# CRASH_ITERS=<n> overrides the number of kill-test iterations for both crash runs.
+# Unset, scripts/crash_test.sh uses its own default: 200 iterations, on the plain build and
+# on the ASan build. Fewer than that may not reach every recovery path (SC-002).
+#
 # Exits non-zero on the first build error, test failure or sanitizer report.
 set -euo pipefail
 
@@ -32,11 +36,14 @@ check() {
   ctest --test-dir "${dir}" --output-on-failure --no-tests=error --timeout 120 "$@"
 }
 
+# Create guards (no open_log()/exists(), O_CREAT only with O_EXCL); see the script.
+scripts/check_create_guard.sh src include || exit 1
+
 # Plain build: everything, including the integration tests that start a real nbdkit.
 check build ""
 # The kill test: SIGKILL a real server mid-run and scan the log. It needs no
 # root and no /dev/nbd*, so it runs in CI too. A failure makes check.sh exit non-zero.
-BUILD_DIR=build scripts/crash_test.sh
+BUILD_DIR=build scripts/crash_test.sh ${CRASH_ITERS:+"${CRASH_ITERS}"}
 
 # ASan build: the unit tests run as usual. The integration tests load the plugin into
 # nbdkit, which is not built with ASan, so the ASan runtime must be first in nbdkit's
@@ -54,7 +61,7 @@ fi
 LD_PRELOAD="${asan_lib}" ASAN_OPTIONS="halt_on_error=1:detect_leaks=0" \
   ctest --test-dir build-asan --output-on-failure --no-tests=error --timeout 120 -L integration
 LD_PRELOAD="${asan_lib}" ASAN_OPTIONS="halt_on_error=1:detect_leaks=0" \
-  BUILD_DIR=build-asan scripts/crash_test.sh
+  BUILD_DIR=build-asan scripts/crash_test.sh ${CRASH_ITERS:+"${CRASH_ITERS}"}
 
 # TSan runs only the unit tests: nbdkit is not built with TSan.
 check build-tsan thread -L unit

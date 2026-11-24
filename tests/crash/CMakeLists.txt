@@ -9,8 +9,9 @@ target_include_directories(crash_test PRIVATE ../integration)
 # harness.cc reports problems with gtest's ADD_FAILURE, so gtest is linked, but
 # crash_test.cc has its own main().
 target_link_libraries(crash_test PRIVATE
-  logblock_core PkgConfig::LIBNBD GTest::gtest)
+  test_support logblock_core PkgConfig::LIBNBD GTest::gtest)
 add_dependencies(crash_test nbdkit_logblock_plugin)
 target_compile_definitions(crash_test PRIVATE
   LOGBLOCK_TEST_TMP_DIR="${CMAKE_BINARY_DIR}/test-tmp"
+  LOGBLOCK_CRASH_FAILURE_DIR="${CMAKE_BINARY_DIR}/crash-failures"
   LOGBLOCK_PLUGIN_PATH="$<TARGET_FILE:nbdkit_logblock_plugin>")

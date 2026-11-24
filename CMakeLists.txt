@@ -57,11 +57,13 @@ pkg_check_modules(LIBNBD REQUIRED IMPORTED_TARGET libnbd) # test client
 # plugin (a shared object) and into the tests.
 add_library(logblock_core STATIC
   src/block_map.cc
+  src/checkpoint.cc
   src/engine.cc
   src/io_posix.cc
   src/log_file.cc
   src/log_scan.cc
-  src/record.cc)
+  src/record.cc
+  src/recovery.cc)
 set_target_properties(logblock_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # include/ is the public interface. src/ holds internal headers such as
 # record.h, and is visible too so the unit tests can test those pieces directly.

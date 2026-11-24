@@ -34,6 +34,8 @@ static_assert(kOffCrc + 4 == kRecordHeaderSize, "the CRC is the last header fiel
 constexpr std::array<uint8_t, 4> kMagic = {'L', 'B', 'L', 'K'};
 
 // Writes `value` into p[0..width) least significant byte first.
+// Every call passes a field value then a literal width, and the tests check every field.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 void put_le(uint8_t* p, uint64_t value, size_t width) {
   for (size_t i = 0; i < width; ++i) {
     p[i] = static_cast<uint8_t>(value >> (8 * i));

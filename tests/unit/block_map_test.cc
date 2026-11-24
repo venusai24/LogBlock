@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <span>
+#include <vector>
 
 #include "logblock/engine.h"
 
@@ -159,6 +161,92 @@ TEST(BlockMap, ABlockCanBeMappedAgainAfterBeingCleared) {
   EXPECT_EQ(map.get(8), kNone);
   map.set(8, 200);
   EXPECT_EQ(map.get(8), Offset(200));
+}
+
+TEST(BlockMap, SnapshotOfAFreshMapIsAllSentinel) {
+  BlockMap map;
+  auto snap = map.snapshot();
+  ASSERT_EQ(snap.size(), kBlockCount);
+  uint64_t not_sentinel = 0;
+  for (uint64_t entry : snap) {
+    if (entry != 0xFFFFFFFFFFFFFFFFULL) {
+      ++not_sentinel;
+    }
+  }
+  EXPECT_EQ(not_sentinel, 0U);
+}
+
+TEST(BlockMap, SnapshotReflectsSetAndClearRange) {
+  BlockMap map;
+  auto snap = map.snapshot();  // a live view: taken once, checked after each change
+  map.set(0, 0);               // offset 0 is a real mapped value, not the sentinel
+  map.set(7, 4136);
+  map.set(kBlockCount - 1, 99);
+  EXPECT_EQ(snap[0], 0U);
+  EXPECT_EQ(snap[7], 4136U);
+  EXPECT_EQ(snap[kBlockCount - 1], 99U);
+  EXPECT_EQ(snap[1], BlockMap::kUnmapped);
+  map.clear_range(7, 1);
+  EXPECT_EQ(snap[7], BlockMap::kUnmapped);
+  EXPECT_EQ(snap[0], 0U);
+}
+
+TEST(BlockMap, LoadThenGetReturnsTheLoadedValues) {
+  std::vector<uint64_t> entries(kBlockCount, BlockMap::kUnmapped);
+  entries[0] = 0;  // offset 0 is valid
+  entries[3] = 5000;
+  entries[kBlockCount - 1] = (1ULL << 40) + 1;
+  BlockMap map;
+  map.load(std::span<const uint64_t, kBlockCount>(entries));
+  EXPECT_EQ(map.get(0), Offset(0));
+  EXPECT_EQ(map.get(3), Offset(5000));
+  EXPECT_EQ(map.get(kBlockCount - 1), Offset((1ULL << 40) + 1));
+  EXPECT_EQ(map.get(1), kNone);  // a sentinel entry reads as unmapped
+  EXPECT_EQ(map.get(kBlockCount - 2), kNone);
+}
+
+TEST(BlockMap, LoadKeepsOffsetZeroInTheSnapshot) {
+  std::vector<uint64_t> entries(kBlockCount, BlockMap::kUnmapped);
+  entries[10] = 0;
+  BlockMap map;
+  map.load(std::span<const uint64_t, kBlockCount>(entries));
+  EXPECT_EQ(map.snapshot()[10], 0U);
+  EXPECT_EQ(map.snapshot()[11], BlockMap::kUnmapped);
+}
+
+TEST(BlockMap, LoadReplacesPreviousContentsCompletely) {
+  BlockMap map;
+  map_first(map, 100);
+  map.set(kBlockCount - 1, 7);
+  std::vector<uint64_t> entries(kBlockCount, BlockMap::kUnmapped);
+  entries[50] = 123;
+  map.load(std::span<const uint64_t, kBlockCount>(entries));
+  EXPECT_EQ(map.get(50), Offset(123));
+  EXPECT_EQ(map.get(0), kNone);  // earlier mappings are gone
+  EXPECT_EQ(map.get(99), kNone);
+  EXPECT_EQ(map.get(kBlockCount - 1), kNone);
+}
+
+TEST(BlockMap, LoadCopiesTheEntries) {
+  // Changing the source after load must not change the map.
+  std::vector<uint64_t> entries(kBlockCount, BlockMap::kUnmapped);
+  entries[2] = 20;
+  BlockMap map;
+  map.load(std::span<const uint64_t, kBlockCount>(entries));
+  entries[2] = 21;
+  EXPECT_EQ(map.get(2), Offset(20));
+}
+
+TEST(BlockMap, SnapshotOfAMapCanBeLoadedIntoAnother) {
+  BlockMap a;
+  map_first(a, 20);
+  a.set(0, 0);
+  a.clear_range(5, 3);
+  BlockMap b;
+  b.load(a.snapshot());
+  for (uint64_t blk = 0; blk < 25; ++blk) {
+    EXPECT_EQ(b.get(blk), a.get(blk)) << "block " << blk;
+  }
 }
 
 // The preconditions are checked with assert(), so they fail loudly in the Debug

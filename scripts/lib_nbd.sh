@@ -39,12 +39,11 @@ parse_data_dir_arg() {
   done
 }
 
-# check_environment: the refusals shared by both scripts. Nothing here changes
-# the system or uses sudo; it only reads.
+# check_data_dir: the refusals every script shares. Nothing here changes the system
+# or uses sudo; it only reads.
 #   - --data-dir given, an existing directory, and not on tmpfs/ramfs
-#   - the nbd kernel module is loaded (we never load it ourselves)
-#   - /dev/nbd0 exists and is not already attached to a server
-check_environment() {
+# Sets DATA_DIR to its absolute path.
+check_data_dir() {
   [[ -n "${DATA_DIR}" ]] || die "--data-dir <dir> is required"
   [[ -d "${DATA_DIR}" ]] || die "--data-dir is not a directory: ${DATA_DIR}"
   DATA_DIR=$(realpath "${DATA_DIR}")
@@ -56,7 +55,14 @@ check_environment() {
   if [[ "${fstype}" == tmpfs || "${fstype}" == ramfs ]]; then
     die "--data-dir ${DATA_DIR} is on ${fstype}; use a directory on a real disk"
   fi
+}
 
+# check_nbd_device: the refusals for scripts that attach /dev/nbd0 (e2e.sh and
+# bench.sh --only baseline). Scripts that talk to nbdkit over the Unix socket
+# with libnbd or fio's nbd engine need no device and skip this. Read-only, no sudo.
+#   - the nbd kernel module is loaded (we never load it ourselves)
+#   - /dev/nbd0 exists and is not already attached to a server
+check_nbd_device() {
   # lsmod lists loaded modules, one per line, name first.
   if ! lsmod | awk '{print $1}' | grep -qx nbd; then
     die "the nbd kernel module is not loaded; run: sudo modprobe nbd"
@@ -71,6 +77,12 @@ check_environment() {
   if grep -q "^${NBD_DEV} " /proc/mounts; then
     die "${NBD_DEV} is mounted; unmount it first"
   fi
+}
+
+# check_environment: both checks, for scripts that need the device (e2e.sh).
+check_environment() {
+  check_data_dir
+  check_nbd_device
 }
 
 # make_run_dir <name prefix>: create a private per-run directory under DATA_DIR

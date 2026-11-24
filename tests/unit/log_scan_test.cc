@@ -15,12 +15,16 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "logblock/engine.h"
 #include "record.h"
+#include "support/fault_io.h"
+#include "support/io_helpers.h"
 
 namespace logblock {
 namespace {
@@ -255,13 +259,15 @@ TEST(LogScanTest, AFileShorterThanOneHeaderIsATornWriteWithNoRecords) {
 }
 
 TEST(LogScanTest, FewerThan40BytesAreATornWriteWhateverTheyContain) {
-  // Too short to hold a header, so there is nothing to validate: 39 zero bytes are torn,
-  // while 40 zero bytes are corruption (see below).
+  // Too short to hold a header, so there is nothing to validate, zero or not.
   const TestLog log = four_records();
-  Bytes file = log.bytes;
-  file.insert(file.end(), 39, uint8_t{0});
+  for (uint8_t fill : {uint8_t{0}, uint8_t{0xEE}}) {
+    SCOPED_TRACE("fill byte " + std::to_string(fill));
+    Bytes file = log.bytes;
+    file.insert(file.end(), 39, fill);
 
-  scan_and_check(file, ScanStop::TornWrite, 4, log.size());
+    scan_and_check(file, ScanStop::TornWrite, 4, log.size());
+  }
 }
 
 TEST(LogScanTest, AValidHeaderWhoseRecordRunsPastTheEndIsATornWrite) {
@@ -427,17 +433,67 @@ TEST(LogScanTest, AWrongMagicOnAFullHeaderAtTheEndIsCorruption) {
 
 // --- Zeroed space ------------------------------------------------------------------
 
-TEST(LogScanTest, AZeroedRegionOf40OrMoreBytesAtTheEndIsCorruption) {
-  // Zeros can never parse as a record (type 0 is invalid), so preallocated or never-written
-  // space is reported, not skipped.
+TEST(LogScanTest, ZerosFromARecordBoundaryToTheEndAreATornWrite) {
+  // After a power cut the file's new size can be durable while its data never reached the
+  // disk, which leaves zeros where the unsynced records would have been (D19).
   const TestLog log = four_records();
   for (size_t zeros : {size_t{40}, size_t{41}, size_t{4096}, size_t{100000}}) {
     SCOPED_TRACE(std::to_string(zeros) + " zero bytes");
     Bytes file = log.bytes;
     file.insert(file.end(), zeros, uint8_t{0});
 
+    scan_and_check(file, ScanStop::TornWrite, 4, log.size());
+  }
+}
+
+TEST(LogScanTest, ALastRecordOverwrittenWithZerosIsATornWrite) {
+  // The scanner cannot tell this from a record that never reached the disk. If that record
+  // was flushed, only a checkpoint covering it can catch the loss (docs/formats.md).
+  TestLog log = four_records();
+  std::fill(log.bytes.begin() + static_cast<std::ptrdiff_t>(log.starts[3]), log.bytes.end(),
+            uint8_t{0});
+
+  scan_and_check(log.bytes, ScanStop::TornWrite, 3, log.starts[3]);
+}
+
+TEST(LogScanTest, AFileThatIsAllZerosIsATornWriteWithNoRecords) {
+  scan_and_check(Bytes(4096, 0), ScanStop::TornWrite, 0, 0);
+}
+
+TEST(LogScanTest, ANonZeroByteInAZeroTailIsCorruption) {
+  // The tail must be zeros all the way to the end, so check the first, a middle and the
+  // last byte of it.
+  const TestLog log = four_records();
+  for (size_t position : {size_t{0}, size_t{2048}, size_t{4095}}) {
+    SCOPED_TRACE("non-zero byte at tail position " + std::to_string(position));
+    Bytes file = log.bytes;
+    file.insert(file.end(), 4096, uint8_t{0});
+    file[log.size() + position] = 1;
+
     scan_and_check(file, ScanStop::Corrupt, 4, log.size());
   }
+}
+
+TEST(LogScanTest, ZerosThatDoNotStartAtARecordBoundaryAreCorruption) {
+  // 20 bytes of a fifth record, then zeros: the invalid position is not all zeros, and the
+  // bytes there do not form a valid header.
+  const TestLog log = four_records();
+  TestLog next;
+  next.add_data(5, 13, 4);
+  Bytes file = log.bytes;
+  file.insert(file.end(), next.bytes.begin(), next.bytes.begin() + 20);
+  file.insert(file.end(), 100, uint8_t{0});
+
+  scan_and_check(file, ScanStop::Corrupt, 4, log.size());
+}
+
+TEST(LogScanTest, ACompleteFinalRecordWhosePayloadEndsInZerosIsCorruption) {
+  // A record cut across a page boundary after a power cut looks like this. It is complete
+  // and non-zero with a bad CRC, so the rule stays conservative (D19).
+  TestLog log = four_records();
+  std::fill(log.bytes.end() - 2048, log.bytes.end(), uint8_t{0});
+
+  scan_and_check(log.bytes, ScanStop::Corrupt, 3, log.starts[3]);
 }
 
 TEST(LogScanTest, AZeroedRegionInTheMiddleIsCorruptionAndLaterRecordsAreNotReturned) {
@@ -451,7 +507,7 @@ TEST(LogScanTest, AZeroedRegionInTheMiddleIsCorruptionAndLaterRecordsAreNotRetur
   scan_and_check(log.bytes, ScanStop::Corrupt, 2, hole);
 }
 
-TEST(LogScanTest, ARecordOverwrittenWithZerosIsCorruption) {
+TEST(LogScanTest, ARecordOverwrittenWithZerosBeforeTheLastRecordIsCorruption) {
   TestLog log = four_records();
   std::fill(log.bytes.begin() + static_cast<std::ptrdiff_t>(log.starts[2]),
             log.bytes.begin() + static_cast<std::ptrdiff_t>(log.end_of(2)), uint8_t{0});
@@ -459,8 +515,564 @@ TEST(LogScanTest, ARecordOverwrittenWithZerosIsCorruption) {
   scan_and_check(log.bytes, ScanStop::Corrupt, 2, log.starts[2]);
 }
 
-TEST(LogScanTest, AFileThatIsAllZerosIsCorruptionWithNoRecords) {
-  scan_and_check(Bytes(4096, 0), ScanStop::Corrupt, 0, 0);
+
+// --- Streaming scan ------------------------------------------------------------------
+// scan_log_stream reads through Io in chunks. It shares one classifier with scan_log, so the
+// tests below check that the two agree, then check what only the streaming form does: a start
+// offset, chunk boundaries, and Io failures. Chunk sizes smaller than a record force every kind
+// of boundary (inside a header, inside a payload, between records, inside a zero tail).
+
+using test::FaultIo;
+using Op = FaultIo::Op;
+
+// What one streaming scan returned, and the records it visited.
+struct StreamRun {
+  Status status;
+  StreamScanResult result;
+  std::vector<ScannedRecord> visited;
+};
+
+// Puts `file` into a fresh, opened FaultIo.
+std::unique_ptr<FaultIo> io_with(const Bytes& file) {
+  auto io = std::make_unique<FaultIo>();
+  EXPECT_TRUE(test::open_or_create_log(*io, "log").ok());
+  io->bytes().assign(file.begin(), file.end());
+  return io;
+}
+
+StreamRun stream_scan(FaultIo& io, uint64_t start = 0, uint64_t seq = 1,
+                      size_t chunk = kScanChunkSize) {
+  StreamRun run;
+  run.status = scan_log_stream(
+      io, start, seq, [&](const ScannedRecord& rec) { run.visited.push_back(rec); }, &run.result,
+      chunk);
+  return run;
+}
+
+StreamRun stream_scan(const Bytes& file, uint64_t start = 0, uint64_t seq = 1,
+                      size_t chunk = kScanChunkSize) {
+  auto io = io_with(file);
+  return stream_scan(*io, start, seq, chunk);
+}
+
+// Checks that the streaming scan classifies `file` exactly as scan_log does.
+void expect_same_as_scan_log(const Bytes& file, size_t chunk) {
+  SCOPED_TRACE("chunk size " + std::to_string(chunk));
+  const ScanResult want = scan_log(file);
+  const StreamRun got = stream_scan(file, 0, 1, chunk);
+
+  ASSERT_TRUE(got.status.ok()) << got.status.to_string();
+  EXPECT_EQ(scan_stop_name(got.result.stop), std::string(scan_stop_name(want.stop)));
+  EXPECT_EQ(got.result.valid_end, want.valid_end);
+  EXPECT_EQ(got.result.detail, want.detail);
+  EXPECT_EQ(got.result.records, want.records.size());
+  EXPECT_EQ(got.result.next_seq, want.records.size() + 1);
+  ASSERT_EQ(got.visited.size(), want.records.size());
+  for (size_t i = 0; i < want.records.size(); ++i) {
+    EXPECT_EQ(got.visited[i].offset, want.records[i].offset);
+    EXPECT_EQ(got.visited[i].header.seq, want.records[i].header.seq);
+    EXPECT_EQ(got.visited[i].header.type, want.records[i].header.type);
+    EXPECT_EQ(got.visited[i].header.block_no, want.records[i].header.block_no);
+    EXPECT_EQ(got.visited[i].header.block_count, want.records[i].header.block_count);
+    EXPECT_EQ(got.visited[i].header.data_len, want.records[i].header.data_len);
+  }
+}
+
+// One image per class of outcome the scan_log tests above cover.
+std::vector<std::pair<std::string, Bytes>> equivalence_cases() {
+  std::vector<std::pair<std::string, Bytes>> cases;
+  const TestLog log = four_records();
+  TestLog next;
+  next.add_data(5, 13, 4);
+
+  cases.emplace_back("empty", Bytes{});
+  cases.emplace_back("clean four records", log.bytes);
+  cases.emplace_back("cut at a boundary",
+                     Bytes(log.bytes.begin(),
+                           log.bytes.begin() + static_cast<std::ptrdiff_t>(log.starts[2])));
+  for (size_t n : {size_t{1}, size_t{39}, size_t{40}, size_t{41}, size_t{2000},
+                   static_cast<size_t>(kDataRecordSize - 1)}) {
+    Bytes file = log.bytes;
+    file.insert(file.end(), next.bytes.begin(), next.bytes.begin() + static_cast<std::ptrdiff_t>(n));
+    cases.emplace_back("fifth record cut after " + std::to_string(n), file);
+  }
+  cases.emplace_back("shorter than a header", Bytes(log.bytes.begin(), log.bytes.begin() + 20));
+  {
+    Bytes file = log.bytes;
+    file.insert(file.end(), 39, uint8_t{0xEE});
+    cases.emplace_back("39 stray bytes", file);
+  }
+  {
+    Bytes file = log.bytes;
+    file.insert(file.end(), kRecordHeaderSize, uint8_t{0xEE});
+    cases.emplace_back("40 bytes of 0xEE", file);
+  }
+  {
+    TestLog gap;
+    gap.add_data(1, 0);
+    gap.add_data(2, 1);
+    gap.add_data(4, 2);
+    gap.add_data(5, 3);
+    cases.emplace_back("seq gap", gap.bytes);
+  }
+  {
+    TestLog first;
+    first.add_data(2, 0);
+    cases.emplace_back("first seq 2", first.bytes);
+  }
+  for (size_t offset : {kRecordHeaderSize + 100, kDataRecordSize - 1, kOffCrc, kOffBlockNo}) {
+    TestLog bad = four_records();
+    bad.bytes[bad.starts[3] + offset] ^= 0x01;
+    cases.emplace_back("last record flipped at " + std::to_string(offset), bad.bytes);
+  }
+  {
+    TestLog bad = four_records();
+    bad.bytes[bad.starts[1] + kOffBlockCount] ^= 0x01;
+    cases.emplace_back("bad TRIM in the middle", bad.bytes);
+  }
+  {
+    TestLog bad = four_records();
+    put_le(bad.bytes, bad.starts[2] + kOffBlockCount, 2, 4);
+    reseal(bad.bytes, bad.starts[2], kDataRecordSize);
+    cases.emplace_back("rule 5 broken", bad.bytes);
+    Bytes cut(bad.bytes.begin(),
+              bad.bytes.begin() + static_cast<std::ptrdiff_t>(bad.starts[2] + 1000));
+    cases.emplace_back("rule 5 broken and cut short", cut);
+  }
+  for (size_t zeros : {size_t{39}, size_t{40}, size_t{41}, size_t{4096}, size_t{100000}}) {
+    Bytes file = log.bytes;
+    file.insert(file.end(), zeros, uint8_t{0});
+    cases.emplace_back(std::to_string(zeros) + " zero bytes at the end", file);
+  }
+  for (size_t position : {size_t{0}, size_t{2048}, size_t{4095}}) {
+    Bytes file = log.bytes;
+    file.insert(file.end(), 4096, uint8_t{0});
+    file[log.size() + position] = 1;
+    cases.emplace_back("zero tail with a 1 at " + std::to_string(position), file);
+  }
+  {
+    TestLog zeroed = four_records();
+    std::fill(zeroed.bytes.begin() + static_cast<std::ptrdiff_t>(zeroed.starts[3]),
+              zeroed.bytes.end(), uint8_t{0});
+    cases.emplace_back("last record zeroed", zeroed.bytes);
+  }
+  {
+    TestLog zeroed = four_records();
+    std::fill(zeroed.bytes.end() - 2048, zeroed.bytes.end(), uint8_t{0});
+    cases.emplace_back("last payload ends in zeros", zeroed.bytes);
+  }
+  cases.emplace_back("all zeros", Bytes(4096, 0));
+  {
+    TestLog hole;
+    hole.add_data(1, 0);
+    hole.add_data(2, 1);
+    hole.bytes.insert(hole.bytes.end(), 100, uint8_t{0});
+    hole.add_data(3, 2);
+    cases.emplace_back("zero hole in the middle", hole.bytes);
+  }
+  {
+    Bytes file = log.bytes;
+    file.insert(file.end(), next.bytes.begin(), next.bytes.begin() + 20);
+    file.insert(file.end(), 100, uint8_t{0});
+    cases.emplace_back("20 bytes of a record then zeros", file);
+  }
+  return cases;
+}
+
+TEST(LogScanStreamTest, ClassifiesEveryScanLogCaseTheSameAtManyChunkSizes) {
+  // 1 and 7: inside a header. 40 and 41: header-sized. 4136 and 4137: record-sized. A huge
+  // chunk: the whole file in one read.
+  for (const auto& [name, file] : equivalence_cases()) {
+    SCOPED_TRACE(name);
+    for (size_t chunk : {size_t{1}, size_t{7}, size_t{40}, size_t{41}, size_t{4136}, size_t{4137},
+                         kScanChunkSize}) {
+      expect_same_as_scan_log(file, chunk);
+    }
+  }
+}
+
+TEST(LogScanStreamTest, ACleanLogReportsRecordsNextSeqAndValidEnd) {
+  const TestLog log = four_records();
+
+  const StreamRun run = stream_scan(log.bytes);
+
+  ASSERT_TRUE(run.status.ok());
+  EXPECT_EQ(run.result.stop, ScanStop::Clean);
+  EXPECT_EQ(run.result.valid_end, log.size());
+  EXPECT_EQ(run.result.records, 4U);
+  EXPECT_EQ(run.result.next_seq, 5U);
+  EXPECT_TRUE(run.result.detail.empty());
+}
+
+TEST(LogScanStreamTest, AnEmptyFileIsCleanAndNextSeqIsTheExpectedSeq) {
+  const StreamRun run = stream_scan(Bytes{}, 0, 7);
+
+  ASSERT_TRUE(run.status.ok());
+  EXPECT_EQ(run.result.stop, ScanStop::Clean);
+  EXPECT_EQ(run.result.records, 0U);
+  EXPECT_EQ(run.result.next_seq, 7U);
+  EXPECT_EQ(run.result.valid_end, 0U);
+}
+
+TEST(LogScanStreamTest, EveryChunkSizeFromOneByteUpSeesRecordsThatCrossBoundaries) {
+  // Chunks 1 to 130 put a boundary at every offset in each header; the larger ones put one
+  // just inside and just outside each payload.
+  const TestLog log = four_records();
+  std::vector<size_t> chunks;
+  for (size_t c = 1; c <= 130; ++c) {
+    chunks.push_back(c);
+  }
+  for (size_t c : {size_t{4095}, size_t{4096}, size_t{4097}, size_t{4135}, size_t{4175},
+                   size_t{4176}, size_t{4177}, size_t{8272}, size_t{12447}, size_t{12448},
+                   size_t{12449}}) {
+    chunks.push_back(c);
+  }
+  for (size_t chunk : chunks) {
+    expect_same_as_scan_log(log.bytes, chunk);
+  }
+}
+
+TEST(LogScanStreamTest, AChunkSizeOfZeroIsTreatedAsOneByte) {
+  // Guards against a loop that never makes progress.
+  const TestLog log = four_records();
+  const StreamRun run = stream_scan(log.bytes, 0, 1, 0);
+
+  ASSERT_TRUE(run.status.ok());
+  EXPECT_EQ(run.result.stop, ScanStop::Clean);
+  EXPECT_EQ(run.result.records, 4U);
+}
+
+// --- Start offset and expected seq ----------------------------------------------------
+
+TEST(LogScanStreamTest, ScansFromARecordBoundaryWithTheMatchingSeq) {
+  const TestLog log = four_records();
+  for (size_t chunk : {size_t{7}, size_t{4136}, kScanChunkSize}) {
+    SCOPED_TRACE("chunk " + std::to_string(chunk));
+    const StreamRun run = stream_scan(log.bytes, log.starts[2], 3, chunk);
+
+    ASSERT_TRUE(run.status.ok());
+    EXPECT_EQ(run.result.stop, ScanStop::Clean);
+    EXPECT_EQ(run.result.valid_end, log.size());
+    EXPECT_EQ(run.result.records, 2U);
+    EXPECT_EQ(run.result.next_seq, 5U);
+    ASSERT_EQ(run.visited.size(), 2U);
+    EXPECT_EQ(run.visited[0].offset, log.starts[2]);  // absolute, not relative to the start
+    EXPECT_EQ(run.visited[0].header.seq, 3U);
+    EXPECT_EQ(run.visited[1].offset, log.starts[3]);
+    EXPECT_EQ(run.visited[1].header.seq, 4U);
+  }
+}
+
+TEST(LogScanStreamTest, AWrongFirstSeqAtAStartOffsetIsCorruptAndDetailNamesTheAbsoluteOffset) {
+  const TestLog log = four_records();
+  for (uint64_t seq : {uint64_t{1}, uint64_t{2}, uint64_t{4}}) {
+    SCOPED_TRACE("expected seq " + std::to_string(seq));
+    const StreamRun run = stream_scan(log.bytes, log.starts[2], seq);
+
+    ASSERT_TRUE(run.status.ok());
+    EXPECT_EQ(run.result.stop, ScanStop::Corrupt);
+    EXPECT_EQ(run.result.valid_end, log.starts[2]);
+    EXPECT_EQ(run.result.records, 0U);
+    EXPECT_EQ(run.result.next_seq, seq);  // no record was valid
+    EXPECT_TRUE(run.visited.empty());
+    EXPECT_NE(run.result.detail.find("offset " + std::to_string(log.starts[2])), std::string::npos)
+        << run.result.detail;
+  }
+}
+
+TEST(LogScanStreamTest, AStartOffsetAtTheEndOfTheFileIsCleanWithNoRecords) {
+  const TestLog log = four_records();
+
+  const StreamRun run = stream_scan(log.bytes, log.size(), 5);
+
+  ASSERT_TRUE(run.status.ok());
+  EXPECT_EQ(run.result.stop, ScanStop::Clean);
+  EXPECT_EQ(run.result.valid_end, log.size());
+  EXPECT_EQ(run.result.records, 0U);
+  EXPECT_EQ(run.result.next_seq, 5U);
+}
+
+TEST(LogScanStreamTest, AStartOffsetPastTheEndOfTheFileIsCorrupt) {
+  // A checkpoint that points past the log means the log lost data. That is damage, so it is
+  // not a torn write.
+  const TestLog log = four_records();
+
+  const StreamRun run = stream_scan(log.bytes, log.size() + 1, 5);
+
+  ASSERT_TRUE(run.status.ok());
+  EXPECT_EQ(run.result.stop, ScanStop::Corrupt);
+  EXPECT_EQ(run.result.valid_end, log.size() + 1);
+  EXPECT_EQ(run.result.records, 0U);
+  EXPECT_EQ(run.result.next_seq, 5U);
+  EXPECT_FALSE(run.result.detail.empty());
+}
+
+TEST(LogScanStreamTest, AStartOffsetInTheMiddleOfARecordIsCorrupt) {
+  const TestLog log = four_records();
+
+  const StreamRun run = stream_scan(log.bytes, log.starts[1] + 3, 2);
+
+  ASSERT_TRUE(run.status.ok());
+  EXPECT_EQ(run.result.stop, ScanStop::Corrupt);
+  EXPECT_EQ(run.result.valid_end, log.starts[1] + 3);
+}
+
+TEST(LogScanStreamTest, TornAndCorruptTailsAfterAStartOffsetKeepAbsoluteOffsets) {
+  const TestLog log = four_records();
+  {
+    SCOPED_TRACE("torn: last record cut short");
+    const Bytes file(log.bytes.begin(), log.bytes.end() - 1);
+    const StreamRun run = stream_scan(file, log.starts[1], 2, 11);
+
+    ASSERT_TRUE(run.status.ok());
+    EXPECT_EQ(run.result.stop, ScanStop::TornWrite);
+    EXPECT_EQ(run.result.valid_end, log.starts[3]);
+    EXPECT_EQ(run.result.records, 2U);
+    EXPECT_EQ(run.result.next_seq, 4U);
+  }
+  {
+    SCOPED_TRACE("corrupt: bad CRC in the third record");
+    TestLog bad = four_records();
+    bad.bytes[bad.starts[2] + kRecordHeaderSize + 5] ^= 0x01;
+    const StreamRun run = stream_scan(bad.bytes, log.starts[1], 2, 11);
+
+    ASSERT_TRUE(run.status.ok());
+    EXPECT_EQ(run.result.stop, ScanStop::Corrupt);
+    EXPECT_EQ(run.result.valid_end, log.starts[2]);
+    EXPECT_EQ(run.result.records, 1U);
+    EXPECT_EQ(run.result.next_seq, 3U);
+  }
+}
+
+// --- Zero tails across chunk boundaries -------------------------------------------------
+
+TEST(LogScanStreamTest, ATornZeroTailIsFoundWhereverTheChunkBoundaryFalls) {
+  // The log is 12,448 bytes. Chunk sizes around that put the first boundary at every position
+  // from 50 bytes before the end of the last record to 110 bytes into the tail.
+  const TestLog log = four_records();
+  Bytes file = log.bytes;
+  file.insert(file.end(), 100, uint8_t{0});
+  for (size_t chunk = log.size() - 50; chunk <= log.size() + 110; ++chunk) {
+    SCOPED_TRACE("chunk " + std::to_string(chunk));
+    const StreamRun run = stream_scan(file, 0, 1, chunk);
+
+    ASSERT_TRUE(run.status.ok());
+    EXPECT_EQ(run.result.stop, ScanStop::TornWrite);
+    EXPECT_EQ(run.result.valid_end, log.size());
+    EXPECT_EQ(run.result.records, 4U);
+  }
+}
+
+TEST(LogScanStreamTest, ANonZeroByteInAZeroTailIsCorruptWhereverTheChunkBoundaryFalls) {
+  const TestLog log = four_records();
+  for (size_t position : {size_t{0}, size_t{1}, size_t{39}, size_t{40}, size_t{99}}) {
+    Bytes file = log.bytes;
+    file.insert(file.end(), 100, uint8_t{0});
+    file[log.size() + position] = 1;
+    for (size_t chunk = log.size() - 50; chunk <= log.size() + 110; ++chunk) {
+      SCOPED_TRACE("non-zero at tail position " + std::to_string(position) + ", chunk " +
+                   std::to_string(chunk));
+      const StreamRun run = stream_scan(file, 0, 1, chunk);
+
+      ASSERT_TRUE(run.status.ok());
+      EXPECT_EQ(run.result.stop, ScanStop::Corrupt);
+      EXPECT_EQ(run.result.valid_end, log.size());
+      EXPECT_EQ(run.result.records, 4U);
+    }
+  }
+}
+
+TEST(LogScanStreamTest, AZeroTailManyChunksLongIsTornAndAStrayByteAnywhereInItIsCorrupt) {
+  // 60,000 zero bytes at chunk 4,096 is about 15 chunks. The stray byte goes just before, on
+  // and just after chunk boundaries, and in the very last byte of the file.
+  const TestLog log = four_records();
+  constexpr size_t kChunk = 4096;
+  constexpr size_t kTail = 60000;
+  Bytes zeros = log.bytes;
+  zeros.insert(zeros.end(), kTail, uint8_t{0});
+
+  const StreamRun torn = stream_scan(zeros, 0, 1, kChunk);
+  ASSERT_TRUE(torn.status.ok());
+  EXPECT_EQ(torn.result.stop, ScanStop::TornWrite);
+  EXPECT_EQ(torn.result.valid_end, log.size());
+
+  for (size_t position :
+       {kChunk * 2 - 1, kChunk * 2, kChunk * 2 + 1, kChunk * 10, kChunk * 14 + 3, kTail - 1}) {
+    SCOPED_TRACE("stray byte at tail position " + std::to_string(position));
+    Bytes file = zeros;
+    file[log.size() + position] = 0x80;
+    const StreamRun run = stream_scan(file, 0, 1, kChunk);
+
+    ASSERT_TRUE(run.status.ok());
+    EXPECT_EQ(run.result.stop, ScanStop::Corrupt);
+    EXPECT_EQ(run.result.valid_end, log.size());
+  }
+}
+
+// --- Memory and read pattern ----------------------------------------------------------
+
+TEST(LogScanStreamTest, ReadsEveryByteOnceInRequestsNoLargerThanTheChunk) {
+  // No re-reads, and no read bigger than the chunk: the window cannot grow with the file.
+  const TestLog log = four_records();
+  for (size_t chunk : {size_t{1}, size_t{100}, size_t{1000}, size_t{4136}, size_t{5000}}) {
+    SCOPED_TRACE("chunk " + std::to_string(chunk));
+    auto io = io_with(log.bytes);
+    const StreamRun run = stream_scan(*io, 0, 1, chunk);
+
+    ASSERT_TRUE(run.status.ok());
+    uint64_t total = 0;
+    for (const FaultIo::Call& call : io->calls()) {
+      if (call.op == Op::Pread) {
+        EXPECT_LE(call.length, chunk);
+        total += call.length;
+      }
+    }
+    EXPECT_EQ(total, log.size());
+  }
+}
+
+TEST(LogScanStreamTest, ATailOfZerosIsReadInChunksNotAllAtOnce) {
+  const TestLog log = four_records();
+  Bytes file = log.bytes;
+  file.insert(file.end(), 100000, uint8_t{0});
+  auto io = io_with(file);
+
+  const StreamRun run = stream_scan(*io, 0, 1, 4096);
+
+  ASSERT_TRUE(run.status.ok());
+  EXPECT_EQ(run.result.stop, ScanStop::TornWrite);
+  uint64_t total = 0;
+  for (const FaultIo::Call& call : io->calls()) {
+    if (call.op == Op::Pread) {
+      EXPECT_LE(call.length, 4096U);
+      total += call.length;
+    }
+  }
+  EXPECT_EQ(total, file.size());
+}
+
+TEST(LogScanStreamTest, ManyRecordsAreVisitedOneAtATimeWithoutBeingCollected) {
+  // The visitor sees each record as it is found. The result has counters, not a vector.
+  TestLog log;
+  constexpr uint64_t kCount = 5000;
+  for (uint64_t seq = 1; seq <= kCount; ++seq) {
+    log.add_trim(seq, seq % kBlockCount, 1);
+  }
+  auto io = io_with(log.bytes);
+  uint64_t seen = 0;
+  uint64_t last_seq = 0;
+  StreamScanResult result;
+
+  const Status status = scan_log_stream(
+      *io, 0, 1,
+      [&](const ScannedRecord& rec) {
+        ++seen;
+        last_seq = rec.header.seq;
+      },
+      &result, 4096);
+
+  ASSERT_TRUE(status.ok());
+  EXPECT_EQ(result.stop, ScanStop::Clean);
+  EXPECT_EQ(result.records, kCount);
+  EXPECT_EQ(seen, kCount);
+  EXPECT_EQ(last_seq, kCount);
+  EXPECT_EQ(result.next_seq, kCount + 1);
+  EXPECT_EQ(result.valid_end, log.size());
+}
+
+TEST(LogScanStreamTest, TheVisitorSeesARecordOnlyAfterItIsFullyValidated) {
+  // A record with a bad CRC, or a seq out of order, is never passed to the visitor.
+  TestLog log = four_records();
+  log.bytes[log.starts[3] + kRecordHeaderSize + 9] ^= 0x01;
+
+  const StreamRun run = stream_scan(log.bytes, 0, 1, 50);
+
+  ASSERT_TRUE(run.status.ok());
+  EXPECT_EQ(run.result.stop, ScanStop::Corrupt);
+  ASSERT_EQ(run.visited.size(), 3U);
+  EXPECT_EQ(run.visited.back().header.seq, 3U);
+}
+
+// --- Io failures -----------------------------------------------------------------------
+
+TEST(LogScanStreamTest, AFailedFileSizeReturnsTheIoStatusNotAClassification) {
+  const TestLog log = four_records();
+  auto io = io_with(log.bytes);
+  io->fail_next(Op::FileSize, StatusCode::IoError);
+
+  const StreamRun run = stream_scan(*io);
+
+  EXPECT_EQ(run.status.code(), StatusCode::IoError);
+  EXPECT_NE(run.status.message().find("file_size"), std::string::npos) << run.status.to_string();
+  EXPECT_TRUE(run.visited.empty());
+}
+
+TEST(LogScanStreamTest, AFailedFirstPreadReturnsTheIoStatusNotAClassification) {
+  const TestLog log = four_records();
+  auto io = io_with(log.bytes);
+  io->fail_next(Op::Pread, StatusCode::IoError);
+
+  const StreamRun run = stream_scan(*io);
+
+  EXPECT_EQ(run.status.code(), StatusCode::IoError);
+  EXPECT_NE(run.status.message().find("pread"), std::string::npos) << run.status.to_string();
+  EXPECT_TRUE(run.visited.empty());
+}
+
+TEST(LogScanStreamTest, AFailedPreadInTheMiddleOfAScanStopsWithTheIoStatus) {
+  const TestLog log = four_records();
+  auto io = io_with(log.bytes);
+  uint64_t seen = 0;
+  StreamScanResult result;
+
+  // Two records are delivered, then the next pread fails. The third record is 4,136 bytes and
+  // the window (chunk 100) cannot hold it yet, so it needs more reads.
+  const Status status = scan_log_stream(
+      *io, 0, 1,
+      [&](const ScannedRecord&) {
+        if (++seen == 2) {
+          io->fail_next(Op::Pread, StatusCode::NoSpace);
+        }
+      },
+      &result, 100);
+
+  EXPECT_EQ(status.code(), StatusCode::NoSpace);
+  EXPECT_EQ(seen, 2U);
+}
+
+TEST(LogScanStreamTest, AFailedPreadWhileReadingAZeroTailReturnsTheIoStatus) {
+  // A failed read must not be mistaken for "the rest was zeros" or for a non-zero byte.
+  const TestLog log = four_records();
+  Bytes file = log.bytes;
+  file.insert(file.end(), 5000, uint8_t{0});
+  auto io = io_with(file);
+  uint64_t seen = 0;
+  StreamScanResult result;
+
+  const Status status = scan_log_stream(
+      *io, 0, 1,
+      [&](const ScannedRecord&) {
+        if (++seen == 4) {
+          io->fail_next(Op::Pread, StatusCode::IoError);  // the next read is into the tail
+        }
+      },
+      &result, 1000);
+
+  EXPECT_EQ(status.code(), StatusCode::IoError);
+}
+
+TEST(LogScanStreamTest, AFileThatShrinksDuringTheScanIsAnIoErrorNotAnInfiniteLoop) {
+  // file_size said the bytes were there, but pread returns end of file. Something else is
+  // changing the log, which the scan cannot classify.
+  const TestLog log = four_records();
+  auto io = io_with(log.bytes);
+  StreamScanResult result;
+
+  const Status status = scan_log_stream(
+      *io, 0, 1,
+      [&](const ScannedRecord&) { io->bytes().resize(log.starts[2] + 10); }, &result, 100);
+
+  EXPECT_EQ(status.code(), StatusCode::IoError);
 }
 
 }  // namespace

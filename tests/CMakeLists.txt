@@ -2,7 +2,7 @@
 # Later tasks add their test files to this one executable.
 # Test-only helpers shared by the test executables, such as the in-memory Io
 # that injects failures. Never linked into the plugin.
-add_library(test_support STATIC support/fault_io.cc)
+add_library(test_support STATIC support/fault_io.cc support/power_cut_io.cc support/power_cut_run.cc)
 target_include_directories(test_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_support PUBLIC logblock_core)
 
@@ -11,9 +11,13 @@ add_executable(unit_tests
   unit/status_test.cc
   unit/io_posix_test.cc
   unit/fault_io_test.cc
+  unit/power_cut_io_test.cc
+  unit/power_cut_test.cc
+  unit/power_cut_ordering_test.cc
   unit/engine_constants_test.cc
   unit/record_test.cc
   unit/block_map_test.cc
+  unit/checkpoint_test.cc
   unit/log_file_test.cc
   unit/engine_create_test.cc
   unit/engine_read_write_test.cc
@@ -23,7 +27,12 @@ add_executable(unit_tests
   unit/engine_corrupt_test.cc
   unit/engine_failed_append_test.cc
   unit/engine_flush_test.cc
-  unit/log_scan_test.cc)
+  unit/engine_checkpoint_test.cc
+  unit/log_scan_test.cc
+  unit/recovery_checkpoint_test.cc
+  unit/recovery_test.cc
+  unit/startup_order_test.cc
+  unit/power_cut_startup_test.cc)
 target_link_libraries(unit_tests PRIVATE test_support logblock_core GTest::gtest_main)
 
 # Tests that need real files put them here, under the build directory. /tmp is

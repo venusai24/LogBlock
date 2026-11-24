@@ -8,6 +8,7 @@ a benchmark. These tests pin every setting.
 """
 
 import configparser
+import os
 import shutil
 import subprocess
 import unittest
@@ -90,6 +91,63 @@ class JobFilesTest(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+
+LATENCY_DIR = JOBS_DIR / "latency"
+LATENCY_JOB = "randwrite-4k-qd32-ckpt"
+
+# Values the job file reads from the environment; bench.sh sets them per run.
+LATENCY_ENV = {
+    "NBD_URI": "nbd+unix:///?socket=/nonexistent/nbd.sock",
+    "LAT_WRITES": "24000",
+    "LAT_LOG": "/nonexistent/latency",
+}
+
+
+class LatencyJobTest(unittest.TestCase):
+    """The checkpoint-latency job lives in bench/jobs/latency/, apart from the
+    eight baseline jobs: bench.sh's baseline glob is bench/jobs/*.fio, so a
+    file in the subdirectory can never become a ninth baseline job."""
+
+    def test_baseline_count_is_still_eight(self) -> None:
+        self.assertEqual(len(list(JOBS_DIR.glob("*.fio"))), 8)
+
+    def test_latency_job_is_not_a_baseline_job(self) -> None:
+        self.assertEqual([p.name for p in LATENCY_DIR.glob("*.fio")], [LATENCY_JOB + ".fio"])
+        self.assertNotIn(LATENCY_JOB + ".fio", EXPECTED)
+        self.assertFalse((JOBS_DIR / (LATENCY_JOB + ".fio")).exists())
+
+    def test_settings(self) -> None:
+        section = load_job(LATENCY_DIR / (LATENCY_JOB + ".fio"))[LATENCY_JOB]
+        self.assertEqual(section["ioengine"], "nbd")
+        self.assertEqual(section["rw"], "randwrite")
+        self.assertEqual(section["bs"], "4k")
+        self.assertEqual(section["iodepth"], "32")
+        # one latency row per I/O needs the plain log: no averaging
+        self.assertIn("write_lat_log", section)
+        self.assertNotIn("log_avg_msec", section)
+        # fixed count of I/Os, not a fixed time: the checkpoint must happen once
+        self.assertEqual(section["number_ios"], "${LAT_WRITES}")
+        self.assertNotIn("runtime", section)
+        self.assertNotIn("time_based", section)
+        # no FLUSH is sent (contract): nothing may add an fsync
+        for key in ("fsync", "fdatasync", "end_fsync", "fsync_on_close", "sync"):
+            self.assertNotIn(key, section)
+
+    def test_first_line_is_a_comment(self) -> None:
+        first = (LATENCY_DIR / (LATENCY_JOB + ".fio")).read_text().splitlines()[0]
+        self.assertTrue(first.startswith(";"), first)
+
+    @unittest.skipUnless(shutil.which("fio"), "fio is not installed")
+    def test_fio_accepts_the_file(self) -> None:
+        result = subprocess.run(
+            ["fio", "--parse-only", str(LATENCY_DIR / (LATENCY_JOB + ".fio"))],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, **LATENCY_ENV},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

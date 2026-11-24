@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -11,7 +12,9 @@
 #include <utility>
 
 #include "block_map.h"
+#include "checkpoint.h"
 #include "log_file.h"
+#include "recovery.h"
 
 namespace logblock {
 
@@ -37,44 +40,95 @@ Status check_range(uint64_t offset, uint64_t len) {
 
 }  // namespace
 
-Engine::Engine(PrivateKey, std::unique_ptr<Io> io, uint64_t cap)
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters): created only by Engine::create.
+Engine::Engine(PrivateKey, std::unique_ptr<Io> io, uint64_t cap, uint64_t checkpoint_interval,
+               RecoveredState&& recovered)
     : io_(std::move(io)),
       cap_(cap),
-      map_(std::make_unique<BlockMap>()),
-      log_(std::make_unique<LogFile>(*io_)) {}
+      map_(std::move(recovered.map)),
+      // Resume where the last valid record ended, so the next append lands there (FR-003).
+      log_(std::make_unique<LogFile>(*io_, recovered.end, recovered.next_seq)),
+      checkpoint_interval_(checkpoint_interval),
+      report_(std::move(recovered.report)) {
+  counters_.unreadable = report_.unreadable_checkpoints;
+  ckpt_path_ = recovered.ckpt_path;
+  ckpt_buffer_.assign(kCheckpointSlotSize, 0);
+  ckpt_open_ = recovered.ckpt_open;
+  last_checkpoint_end_ = recovered.last_checkpoint_end;
+  generation_ = recovered.generation;
+  next_slot_ = recovered.next_slot;
+  fresh_checkpoint_due_ = recovered.fresh_checkpoint_due;
+  startup_record_offset_ = recovered.last_record_offset;
+}
 
 Status Engine::create(const std::string& path, uint64_t cap, std::unique_ptr<Io> io,
-                      std::unique_ptr<Engine>* out) {
-  // Check the setting before touching the file, so a bad cap never creates a log.
+                      std::unique_ptr<Engine>* out, uint64_t checkpoint_interval) {
+  // Check the settings before touching any file, so a bad one never creates a log.
   if (cap < kDataRecordSize) {
     return {StatusCode::OutOfRange,
             "cap " + std::to_string(cap) + " is too small: it must be at least " +
                 std::to_string(kDataRecordSize) + " bytes, the size of one DATA record"};
   }
+  if (checkpoint_interval < kMinCheckpointInterval) {
+    return {StatusCode::OutOfRange, "checkpoint_interval " + std::to_string(checkpoint_interval) +
+                                        " is too small: it must be at least " +
+                                        std::to_string(kMinCheckpointInterval) +
+                                        " bytes, the size of one DATA record"};
+  }
 
-  if (Status s = io->open_log(path); !s.ok()) {
+  // Startup order (D28, D34, D35): open the log WITHOUT creating it. If it is missing, create it
+  // with O_EXCL. Take the lock, and only then read anything. Two servers on one log would both
+  // append at the same offsets and silently destroy each other's records, so the second must be
+  // refused while nothing has been read or changed.
+  // The OS releases the lock when the process dies, so a killed server never blocks the next start.
+  CheckpointSlots preread;
+  bool found = false;
+  if (Status s = io->open_log_existing(path, &found); !s.ok()) {
+    return s;  // only "not found" means the log may be created
+  }
+  if (!found) {
+    // A missing log with a valid checkpoint beside it means a device lived here and its log was
+    // lost. Creating an empty one would serve zeros, so refuse first. This only reads (FR-009).
+    if (Status s = check_checkpoints_without_log(*io, path, &preread); !s.ok()) {
+      return s;
+    }
+    // O_EXCL: if something exists at the path now, we change nothing. We cannot tell which it
+    // is: a server that created the log since we looked, or a dangling symlink (O_EXCL refuses
+    // to follow it, and the earlier open without O_CREAT saw it as missing).
+    bool created = false;
+    if (Status s = io->create_log(path, &created); !s.ok()) {
+      return s;
+    }
+    if (!created) {
+      return {StatusCode::Failed,
+              "the log appeared during startup: " + path +
+                  " (another server may have just created it, or the path is a dangling symlink)"};
+    }
+    // The new name is made durable later, by recover(), which syncs the directory on every
+    // successful start (D35). Any refusal after this point (lock, size read, recovery, the
+    // directory sync itself) may leave this empty log behind (FR-009).
+  }
+  if (Status s = io->lock_log(); !s.ok()) {
     return s;
   }
 
-  // M1 has no recovery, so a log that already holds records is refused as it is.
-  // Only reads happen here: the file must stay byte-for-byte unchanged.
-  uint64_t existing_size = 0;
-  if (Status s = io->file_size(&existing_size); !s.ok()) {
-    return s;
-  }
-  if (existing_size != 0) {
-    return {StatusCode::Failed, "log '" + path + "' is not empty (" +
-                                    std::to_string(existing_size) +
-                                    " bytes) and M1 has no recovery; give a new or empty log"};
-  }
-
-  // A newly created file's name is only durable once its directory is synced
-  //, so do it before reporting that the engine exists.
-  if (Status s = io->fsync_parent_dir(); !s.ok()) {
+  // Rebuild the map from the log (and, in time, a checkpoint). Nothing is served until this
+  // returns, so a client can never see a half-recovered device (FR-004).
+  RecoveredState recovered;
+  if (Status s = recover(*io, path, cap, &recovered, &preread); !s.ok()) {
     return s;
   }
 
-  *out = std::make_unique<Engine>(PrivateKey{}, std::move(io), cap);
+  auto engine = std::make_unique<Engine>(PrivateKey{}, std::move(io), cap, checkpoint_interval,
+                                         std::move(recovered));
+
+  // No slot could be used but some were unreadable: the next restart would scan the whole log
+  // again, so write a fresh checkpoint now (FR-016). If it fails the server still starts: the
+  // failure is counted and warned about, and the log is intact.
+  if (engine->fresh_checkpoint_due_) {
+    engine->write_checkpoint(engine->startup_record_offset_);
+  }
+  *out = std::move(engine);
   return Status::Ok();
 }
 
@@ -122,7 +176,7 @@ Status Engine::load_block(uint64_t block, uint8_t* out) {
                                      " points at a record for block " +
                                      std::to_string(record.header.block_no)};
   }
-  std::copy(record.payload.begin(), record.payload.end(), out);
+  std::ranges::copy(record.payload, out);
   return Status::Ok();
 }
 
@@ -219,6 +273,9 @@ Status Engine::write(uint64_t offset, uint64_t len, const void* buf) {
       return s;
     }
     map_->set(block, record_offset);
+    // Per record, not per request: a request that crosses the interval checkpoints at the
+    // crossing, with a snapshot that includes this record and no later one (FR-011).
+    checkpoint_if_due(record_offset);
   }
   return Status::Ok();
 }
@@ -249,10 +306,12 @@ Status Engine::trim(uint64_t offset, uint64_t len) {
 
   // Log first, then change the map, so a failed append leaves the map as it was.
   // Trimming a block that is already unmapped is still logged.
+  const uint64_t record_offset = log_->end();
   if (Status s = log_->append_trim(first_block, static_cast<uint32_t>(block_count)); !s.ok()) {
     return s;
   }
   map_->clear_range(first_block, block_count);
+  checkpoint_if_due(record_offset);
   return Status::Ok();
 }
 
@@ -279,5 +338,97 @@ Status Engine::flush() {
 uint64_t Engine::size() const { return kDeviceSize; }
 
 uint64_t Engine::bytes_logged() const { return log_->end(); }
+
+const RecoveryReport& Engine::recovery_report() const { return report_; }
+
+CheckpointCounters Engine::checkpoint_counters() const { return counters_; }
+
+std::vector<std::string> Engine::take_warnings() { return std::exchange(warnings_, {}); }
+
+void Engine::checkpoint_if_due(uint64_t record_offset) {
+  if (log_->end() - last_checkpoint_end_ >= checkpoint_interval_) {
+    write_checkpoint(record_offset);
+  }
+}
+
+void Engine::write_checkpoint(uint64_t last_record_offset) {
+  // After a failed fsync the log cannot promise durability (D10), and after a failed append it
+  // may hold torn bytes, so a checkpoint vouching for the log's tail would be a lie. A failed
+  // checkpoint disables the next ones (D27).
+  if (checkpoints_disabled_ || flush_failed_ || log_->broken()) {
+    return;
+  }
+  const auto started = std::chrono::steady_clock::now();
+
+  // Any failure ends here: count it, say what failed, and stop checkpointing until restart. The
+  // caller's request was not affected (its record is already appended), so nothing is returned.
+  auto fail = [&](const char* step, const Status& s) {
+    checkpoints_disabled_ = true;
+    ++counters_.failed;
+    warnings_.push_back("checkpoint failed file=" + ckpt_path_ + ": " + step + " failed: " +
+                        s.message() + "; checkpoints are off until restart");
+  };
+
+  // 1. The log must be durable through the covered record before a slot may vouch for it. A
+  // checkpoint that survives a crash while the records it covers do not would point into bytes
+  // that are gone. A failed fsync is sticky, same as for a client flush (D10).
+  if (Status s = io_->fsync(); !s.ok()) {
+    flush_failed_ = true;
+    fail("log fsync", s);
+    return;
+  }
+
+  // 2. Create the checkpoint file the first time it is needed (recovery only looked for it).
+  bool created = false;
+  if (!ckpt_open_) {
+    bool opened = false;
+    if (Status s = io_->open_ckpt(ckpt_path_, /*create=*/true, &opened, &created); !s.ok()) {
+      fail("create", s);
+      return;
+    }
+    ckpt_open_ = true;
+  }
+
+  // 3. Encode into the preallocated buffer and write the whole slot over the older one. The
+  // newer slot is never touched, so a crash mid-write still leaves one good checkpoint.
+  const uint64_t generation = generation_ + 1;
+  encode_slot({.generation = generation,
+               .last_record_offset = last_record_offset,
+               .covered_seq = log_->next_seq() - 1},
+              map_->snapshot(),
+              std::span<uint8_t, kCheckpointSlotSize>(ckpt_buffer_.data(), kCheckpointSlotSize));
+  if (Status s = io_->ckpt_pwrite(checkpoint_slot_offset(next_slot_), ckpt_buffer_.data(),
+                                  ckpt_buffer_.size());
+      !s.ok()) {
+    fail("write", s);
+    return;
+  }
+  if (Status s = io_->ckpt_fsync(); !s.ok()) {
+    fail("fsync", s);
+    return;
+  }
+
+  // 4. A new file's name is only durable once its directory is synced (D26).
+  if (created) {
+    if (Status s = io_->fsync_parent_dir(); !s.ok()) {
+      fail("directory fsync", s);
+      return;
+    }
+  }
+
+  // Done: this slot is now the newest, so the other one is next. Only completed checkpoints
+  // count toward the durations.
+  const auto elapsed = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                            started)
+          .count());
+  generation_ = generation;
+  next_slot_ = 1 - next_slot_;
+  last_checkpoint_end_ = log_->end();
+  ++counters_.written;
+  ++counters_.duration_count;
+  counters_.duration_sum_us += elapsed;
+  counters_.duration_max_us = std::max(counters_.duration_max_us, elapsed);
+}
 
 }  // namespace logblock

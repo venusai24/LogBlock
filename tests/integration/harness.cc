@@ -88,6 +88,10 @@ Harness::~Harness() {
     int status = 0;
     ::waitpid(pid_, &status, 0);
   }
+  if (daemon_pid_ > 0 && ::kill(daemon_pid_, 0) == 0) {
+    ::kill(daemon_pid_, SIGKILL);
+    wait_daemon_gone();
+  }
   if (dir_.empty()) return;
   // This destructor runs at the end of the test body, so HasFailure() already
   // knows if an assertion failed. Keep the directory then, for debugging.
@@ -104,12 +108,20 @@ std::vector<std::string> Harness::default_settings(const std::string& cap) const
 }
 
 bool Harness::start(const std::vector<std::string>& settings, const std::string& plugin) {
+  return launch(settings, plugin) && wait_until_serving();
+}
+
+bool Harness::launch(const std::vector<std::string>& settings, const std::string& plugin) {
+  std::vector<std::string> args = {"nbdkit", "-f", "-U", socket_path(), plugin};
+  args.insert(args.end(), settings.begin(), settings.end());
+  return spawn(std::move(args));
+}
+
+bool Harness::spawn(std::vector<std::string> args) {
   EXPECT_EQ(pid_, -1) << "this Harness already started a server";
 
   // Build the argument list before fork(): after fork only async-signal-safe
   // calls are allowed, and std::string allocation is not one of them.
-  std::vector<std::string> args = {"nbdkit", "-f", "-U", socket_path(), plugin};
-  args.insert(args.end(), settings.begin(), settings.end());
   std::vector<char*> argv;
   argv.reserve(args.size() + 1);
   for (std::string& arg : args) argv.push_back(arg.data());
@@ -135,7 +147,11 @@ bool Harness::start(const std::vector<std::string>& settings, const std::string&
     ::execvp("nbdkit", argv.data());
     _exit(127);  // exec failed: nbdkit is not installed or not on PATH
   }
+  return true;
+}
 
+bool Harness::wait_until_serving() {
+  if (pid_ <= 0) return false;
   // Wait for the socket file, or for nbdkit to give up. We only look at the
   // file system and the process state; we do not connect (see the header).
   const auto deadline = Clock::now() + kStartTimeout;
@@ -146,8 +162,68 @@ bool Harness::start(const std::vector<std::string>& settings, const std::string&
   }
   ADD_FAILURE() << "nbdkit did not create " << socket_path() << " within " << kStartTimeout.count()
                 << " ms; stderr so far:\n"
-                << read_file(stderr_file);
+                << read_file(dir_ + "/stderr.txt");
   stop(SIGKILL);
+  return false;
+}
+
+bool Harness::start_background(const std::vector<std::string>& settings,
+                               const std::string& plugin) {
+  const std::string pid_file = dir_ + "/pid";
+  std::vector<std::string> args = {"nbdkit", "-U", socket_path(), "-P", pid_file, plugin};
+  args.insert(args.end(), settings.begin(), settings.end());
+  if (!spawn(std::move(args))) return false;
+
+  // The foreground process exits once the daemon is ready (after get_ready), or
+  // with an error status if startup was refused.
+  const auto deadline = Clock::now() + kStartTimeout;
+  while (!try_reap()) {
+    if (Clock::now() >= deadline) {
+      ADD_FAILURE() << "foreground nbdkit did not exit within " << kStartTimeout.count() << " ms";
+      ::kill(pid_, SIGKILL);
+      int status = 0;
+      ::waitpid(pid_, &status, 0);
+      finish(status);
+      return false;
+    }
+    std::this_thread::sleep_for(kPollInterval);
+  }
+  if (!exit_->clean()) return false;  // refusal: the message is in stderr.txt
+
+  // nbdkit writes the pid file before the foreground process exits, but be tolerant.
+  for (int attempt = 0; attempt < 100 && daemon_pid_ <= 0; ++attempt) {
+    daemon_pid_ = static_cast<pid_t>(std::atoi(read_file(pid_file).c_str()));
+    if (daemon_pid_ <= 0) std::this_thread::sleep_for(kPollInterval);
+  }
+  if (daemon_pid_ <= 0 || ::kill(daemon_pid_, 0) != 0) {
+    ADD_FAILURE() << "no live daemon named in " << pid_file;
+    daemon_pid_ = -1;
+    return false;
+  }
+  return true;
+}
+
+bool Harness::stop_background() {
+  if (daemon_pid_ <= 0) {
+    ADD_FAILURE() << "stop_background() called but no daemon was started";
+    return false;
+  }
+  ::kill(daemon_pid_, SIGTERM);
+  if (wait_daemon_gone()) return true;
+  ADD_FAILURE() << "daemon " << daemon_pid_ << " did not exit after SIGTERM; killing it";
+  ::kill(daemon_pid_, SIGKILL);
+  wait_daemon_gone();
+  return false;
+}
+
+bool Harness::wait_daemon_gone() {
+  const auto deadline = Clock::now() + kStopTimeout;
+  while (Clock::now() < deadline) {
+    // The daemon was re-parented to init, so waitpid does not work. kill(pid, 0)
+    // sends nothing and fails with ESRCH once the process no longer exists.
+    if (::kill(daemon_pid_, 0) != 0 && errno == ESRCH) return true;
+    std::this_thread::sleep_for(kPollInterval);
+  }
   return false;
 }
 

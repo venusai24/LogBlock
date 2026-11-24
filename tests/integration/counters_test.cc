@@ -13,8 +13,10 @@
 // stderr logger.
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <regex>
 #include <string>
@@ -178,6 +180,114 @@ TEST(Counters, IdleServerReportsZeros) {
   const auto counters = shut_down_and_read_counters(harness, nbd);
   ASSERT_TRUE(counters.has_value());
   EXPECT_EQ(*counters, Counters{});
+}
+
+// The six checkpoint fields of the counters line (contracts/plugin-cli.md, Shutdown).
+struct CheckpointCounters {
+  uint64_t written = 0;
+  uint64_t failed = 0;
+  uint64_t unreadable = 0;
+  uint64_t duration_count = 0;
+  uint64_t duration_max_us = 0;
+  uint64_t duration_sum_us = 0;
+};
+
+std::optional<CheckpointCounters> parse_checkpoint_counters(const std::string& stderr_text) {
+  const std::size_t at = stderr_text.find("counters ");
+  if (at == std::string::npos) return std::nullopt;
+  const std::string line = stderr_text.substr(at, stderr_text.find('\n', at) - at);
+  const auto written = find_value(line, "checkpoints_written");
+  const auto failed = find_value(line, "checkpoints_failed");
+  const auto unreadable = find_value(line, "checkpoints_unreadable");
+  const auto count = find_value(line, "checkpoint_duration_count");
+  const auto max = find_value(line, "checkpoint_duration_max_us");
+  const auto sum = find_value(line, "checkpoint_duration_sum_us");
+  if (!written || !failed || !unreadable || !count || !max || !sum) return std::nullopt;
+  return CheckpointCounters{*written, *failed, *unreadable, *count, *max, *sum};
+}
+
+TEST(Counters, CheckpointCountersAreReportedAtShutdown) {
+  // An interval of two DATA records, and six one-block writes: checkpoints after records 2, 4
+  // and 6. Nothing fails, and no slot was ignored at startup.
+  Harness harness;
+  std::vector<std::string> settings = harness.default_settings("1M");
+  settings.emplace_back("checkpoint_interval=8272");
+  ASSERT_TRUE(harness.start(settings)) << "stderr:\n" << harness.stop().stderr_text;
+  NbdHandle nbd = harness.connect();
+  ASSERT_TRUE(nbd);
+  for (uint64_t block = 0; block < 6; ++block) {
+    write_ok(nbd.get(), kBlockSize, block * kBlockSize);
+  }
+
+  nbd.reset();
+  const ServerExit result = harness.stop(SIGTERM);
+  EXPECT_TRUE(result.clean()) << result.stderr_text;
+  const auto counters = parse_checkpoint_counters(result.stderr_text);
+  ASSERT_TRUE(counters.has_value()) << "stderr:\n" << result.stderr_text;
+  EXPECT_EQ(counters->written, 3U);
+  EXPECT_EQ(counters->failed, 0U);
+  EXPECT_EQ(counters->unreadable, 0U);
+  EXPECT_EQ(counters->duration_count, 3U);
+  EXPECT_LE(counters->duration_max_us, counters->duration_sum_us);
+  EXPECT_EQ(result.stderr_text.find("[warning]"), std::string::npos) << result.stderr_text;
+}
+
+namespace {
+// RAII: restores owner_all on a directory when it goes out of scope.
+class PermissionRestorer {
+ public:
+  explicit PermissionRestorer(std::filesystem::path dir) : dir_(std::move(dir)) {}
+  PermissionRestorer(const PermissionRestorer&) = delete;
+  PermissionRestorer& operator=(const PermissionRestorer&) = delete;
+  ~PermissionRestorer() {
+    std::error_code ec;  // a destructor must not throw
+    std::filesystem::permissions(dir_, std::filesystem::perms::owner_all, ec);
+  }
+
+ private:
+  std::filesystem::path dir_;
+};
+}  // namespace
+
+TEST(Counters, ACheckpointFileThatCannotBeCreatedWarnsOnceAndTheServerKeepsServing) {
+  // The server starts normally, then its directory is made read-only, so creating "<log>.ckpt"
+  // fails at the first checkpoint. Requests keep succeeding (D27), the failure is warned about
+  // once, and it shows in the counters. (A .ckpt that cannot be opened at STARTUP is a refusal
+  // instead: D34, tested in startup_test.cc.)
+  if (geteuid() == 0) GTEST_SKIP() << "root ignores directory permissions";
+  Harness harness;
+  std::vector<std::string> settings = harness.default_settings("1M");
+  settings.emplace_back("checkpoint_interval=8272");
+  ASSERT_TRUE(harness.start(settings)) << "stderr:\n" << harness.stop().stderr_text;
+  // r-x: the socket and the open log keep working; a new file cannot be made.
+  // The guard puts the permissions back when the test ends, even on an early ASSERT return,
+  // so the harness can delete its directory.
+  const PermissionRestorer restore_permissions(harness.dir());
+  std::filesystem::permissions(harness.dir(), std::filesystem::perms::owner_read |
+                                                  std::filesystem::perms::owner_exec);
+  NbdHandle nbd = harness.connect();
+  ASSERT_TRUE(nbd);
+  for (uint64_t block = 0; block < 6; ++block) {
+    write_ok(nbd.get(), kBlockSize, block * kBlockSize);
+  }
+  read_ok(nbd.get(), kBlockSize, 0);
+  ASSERT_EQ(nbd_flush(nbd.get(), 0), 0) << nbd_get_error();
+
+  nbd.reset();
+  const ServerExit result = harness.stop(SIGTERM);
+  EXPECT_TRUE(result.clean()) << result.stderr_text;
+  const std::string text = result.stderr_text;
+  const std::size_t first = text.find("[warning] checkpoint failed");
+  ASSERT_NE(first, std::string::npos) << "stderr:\n" << text;
+  EXPECT_EQ(text.find("[warning] checkpoint failed", first + 1), std::string::npos)
+      << "checkpoints are off after the first failure, so it is warned about once:\n"
+      << text;
+  EXPECT_NE(text.find("checkpoints are off until restart"), std::string::npos) << text;
+  const auto counters = parse_checkpoint_counters(text);
+  ASSERT_TRUE(counters.has_value()) << "stderr:\n" << text;
+  EXPECT_EQ(counters->failed, 1U);
+  EXPECT_EQ(counters->written, 0U);
+  EXPECT_EQ(counters->duration_count, 0U);
 }
 
 }  // namespace

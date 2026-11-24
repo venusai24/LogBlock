@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -53,18 +54,44 @@ class Fd {
 
 class PosixIo final : public Io {
  public:
-  Status open_log(const std::string& path) override {
+  // Opens the log only if it already exists. A missing file is an answer (*found = false), not an
+  // error, and nothing is created: the caller decides what a missing log means.
+  Status open_log_existing(const std::string& path, bool* found) override {
+    *found = false;
     if (fd_.valid()) {
       return {StatusCode::IoError, "log is already open: " + path_};
     }
-    // O_CLOEXEC: do not leak the descriptor into child processes. No O_TRUNC and
-    // no O_APPEND: an existing log is left alone, and writes go to explicit offsets.
-    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    // No O_CREAT (that is the point of this call), no O_TRUNC, no O_APPEND.
+    int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0) {
+      if (errno == ENOENT) {
+        return Status::Ok();
+      }
       return errno_status(errno, "cannot open log " + path);
     }
     fd_ = Fd(fd);
     path_ = path;
+    *found = true;
+    return Status::Ok();
+  }
+
+  // Creates the log, failing if it appeared meanwhile. O_EXCL makes the check and the create one
+  // atomic step, so two servers cannot both think they made the file.
+  Status create_log(const std::string& path, bool* created) override {
+    *created = false;
+    if (fd_.valid()) {
+      return {StatusCode::IoError, "log is already open: " + path_};
+    }
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) {
+      if (errno == EEXIST) {
+        return Status::Ok();  // another server won the race; we keep nothing open
+      }
+      return errno_status(errno, "cannot create log " + path);
+    }
+    fd_ = Fd(fd);
+    path_ = path;
+    *created = true;
     return Status::Ok();
   }
 
@@ -140,6 +167,98 @@ class PosixIo final : public Io {
     return Status::Ok();
   }
 
+  Status lock_log() override {
+    if (Status s = check_open(); !s.ok()) {
+      return s;
+    }
+    // LOCK_NB: never wait. flock locks belong to the open file description, so a second open()
+    // of the same path, even in this process, conflicts. They go away when the file is closed.
+    if (::flock(fd_.get(), LOCK_EX | LOCK_NB) != 0) {
+      if (errno == EWOULDBLOCK) {
+        return {StatusCode::Failed, "log is in use by another server: " + path_};
+      }
+      return errno_status(errno, "flock " + path_);
+    }
+    return Status::Ok();
+  }
+
+  // The two out-flags are the Io contract that every implementation and test shares; a result
+  // struct would touch all of them, so the lint is silenced here.
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  Status open_ckpt(const std::string& path, bool create, bool* opened, bool* created) override {
+    *opened = false;
+    *created = false;
+    if (ckpt_fd_.valid()) {
+      return {StatusCode::IoError, "checkpoint file is already open: " + ckpt_path_};
+    }
+    int fd = -1;
+    if (create) {
+      // O_EXCL first, so success means this call made the file. If it already exists, open it.
+      fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+      if (fd >= 0) {
+        *created = true;
+      } else if (errno == EEXIST) {
+        fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+      }
+    } else {
+      fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+      if (fd < 0 && errno == ENOENT) {
+        return Status::Ok();  // a missing checkpoint file is normal, not an error
+      }
+    }
+    if (fd < 0) {
+      return errno_status(errno, "cannot open checkpoint file " + path);
+    }
+    ckpt_fd_ = Fd(fd);
+    ckpt_path_ = path;
+    *opened = true;
+    return Status::Ok();
+  }
+
+  Status ckpt_size(uint64_t* size) override {
+    if (Status s = check_ckpt_open(); !s.ok()) {
+      return s;
+    }
+    struct stat st{};
+    if (::fstat(ckpt_fd_.get(), &st) != 0) {
+      return errno_status(errno, "fstat " + ckpt_path_);
+    }
+    *size = static_cast<uint64_t>(st.st_size);
+    return Status::Ok();
+  }
+
+  Status ckpt_pread(uint64_t offset, void* buf, size_t len, size_t* bytes_read) override {
+    if (Status s = check_ckpt_open(); !s.ok()) {
+      return s;
+    }
+    return read_fully(
+        [this](void* b, size_t n, uint64_t off) {
+          return ::pread(ckpt_fd_.get(), b, n, static_cast<off_t>(off));
+        },
+        buf, len, offset, bytes_read);
+  }
+
+  Status ckpt_pwrite(uint64_t offset, const void* buf, size_t len) override {
+    if (Status s = check_ckpt_open(); !s.ok()) {
+      return s;
+    }
+    return write_fully(
+        [this](const void* b, size_t n, uint64_t off) {
+          return ::pwrite(ckpt_fd_.get(), b, n, static_cast<off_t>(off));
+        },
+        buf, len, offset);
+  }
+
+  Status ckpt_fsync() override {
+    if (Status s = check_ckpt_open(); !s.ok()) {
+      return s;
+    }
+    if (::fsync(ckpt_fd_.get()) != 0) {
+      return errno_status(errno, "fsync " + ckpt_path_);
+    }
+    return Status::Ok();
+  }
+
  private:
   Status check_open() const {
     if (!fd_.valid()) {
@@ -147,9 +266,17 @@ class PosixIo final : public Io {
     }
     return Status::Ok();
   }
+  Status check_ckpt_open() const {
+    if (!ckpt_fd_.valid()) {
+      return {StatusCode::IoError, "checkpoint file is not open"};
+    }
+    return Status::Ok();
+  }
 
   Fd fd_;
   std::string path_;
+  Fd ckpt_fd_;
+  std::string ckpt_path_;
 };
 
 }  // namespace

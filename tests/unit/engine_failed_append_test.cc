@@ -39,7 +39,12 @@ class NthPwriteFailIo final : public Io {
     partial_bytes_ = partial_bytes;
   }
 
-  Status open_log(const std::string& path) override { return inner_->open_log(path); }
+  Status open_log_existing(const std::string& path, bool* found) override {
+    return inner_->open_log_existing(path, found);
+  }
+  Status create_log(const std::string& path, bool* created) override {
+    return inner_->create_log(path, created);
+  }
   Status file_size(uint64_t* size) override { return inner_->file_size(size); }
   Status pread(uint64_t offset, void* buf, size_t len, size_t* bytes_read) override {
     return inner_->pread(offset, buf, len, bytes_read);
@@ -53,6 +58,18 @@ class NthPwriteFailIo final : public Io {
   Status fsync() override { return inner_->fsync(); }
   Status ftruncate(uint64_t size) override { return inner_->ftruncate(size); }
   Status fsync_parent_dir() override { return inner_->fsync_parent_dir(); }
+  Status lock_log() override { return inner_->lock_log(); }
+  Status open_ckpt(const std::string& path, bool create, bool* opened, bool* created) override {
+    return inner_->open_ckpt(path, create, opened, created);
+  }
+  Status ckpt_size(uint64_t* size) override { return inner_->ckpt_size(size); }
+  Status ckpt_pread(uint64_t offset, void* buf, size_t len, size_t* bytes_read) override {
+    return inner_->ckpt_pread(offset, buf, len, bytes_read);
+  }
+  Status ckpt_pwrite(uint64_t offset, const void* buf, size_t len) override {
+    return inner_->ckpt_pwrite(offset, buf, len);
+  }
+  Status ckpt_fsync() override { return inner_->ckpt_fsync(); }
 
  private:
   std::unique_ptr<test::FaultIo> inner_;

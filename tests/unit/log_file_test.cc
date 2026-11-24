@@ -9,6 +9,7 @@
 
 #include "record.h"
 #include "support/fault_io.h"
+#include "support/io_helpers.h"
 
 namespace logblock {
 namespace {
@@ -63,7 +64,7 @@ std::vector<Found> scan(const std::string& file) {
 
 class LogFileTest : public ::testing::Test {
  protected:
-  void SetUp() override { ASSERT_TRUE(io_.open_log("fake.log").ok()); }
+  void SetUp() override { ASSERT_TRUE(test::open_or_create_log(io_, "fake.log").ok()); }
 
   // Appends a DATA record for `block` and returns the offset it landed at.
   uint64_t append_data(uint64_t block) {
@@ -82,7 +83,7 @@ TEST_F(LogFileTest, ANewLogStartsAtOffsetZeroWithSeqOne) {
   EXPECT_EQ(log_.end(), 0U);
   EXPECT_EQ(log_.next_seq(), 1U);
   EXPECT_TRUE(io_.bytes().empty());
-  EXPECT_TRUE(io_.calls().size() == 1U);  // only the open_log from SetUp
+  EXPECT_EQ(io_.calls().size(), 2U);  // only SetUp's open_log_existing and create_log
 }
 
 TEST_F(LogFileTest, FirstDataRecordGoesAtOffsetZeroWithSeqOne) {
@@ -429,6 +430,163 @@ TEST_F(LogFileTest, ReadRecordReportsAnIoErrorAsIoError) {
   Record r{};
   EXPECT_EQ(log_.read_record(a, &buffer, &r).code(), StatusCode::IoError);
   EXPECT_TRUE(log_.read_record(a, &buffer, &r).ok()) << "the fault was one-shot";
+}
+
+// ---------------------------------------------------------------------------
+// Resuming an existing log at a given end and next_seq (used by recovery).
+// ---------------------------------------------------------------------------
+
+// A fake file that already holds three whole records (DATA 1, TRIM 2, DATA 3), as if
+// an earlier run wrote them. Recovery would then resume at the end of the third record.
+class ResumedLogFileTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    auto p1 = payload_for(1);
+    auto p3 = payload_for(3);
+    std::array<uint8_t, kDataRecordSize> data{};
+    std::array<uint8_t, kTrimRecordSize> trim{};
+    ASSERT_TRUE(encode_data_record(1, 1, p1, data).ok());
+    io_.bytes().append(reinterpret_cast<const char*>(data.data()), data.size());
+    ASSERT_TRUE(encode_trim_record(2, 10, 3, trim).ok());
+    io_.bytes().append(reinterpret_cast<const char*>(trim.data()), trim.size());
+    ASSERT_TRUE(encode_data_record(3, 3, p3, data).ok());
+    io_.bytes().append(reinterpret_cast<const char*>(data.data()), data.size());
+    ASSERT_TRUE(test::open_or_create_log(io_, "fake.log").ok());
+    ASSERT_EQ(io_.bytes().size(), kResumedEnd);
+  }
+
+  static constexpr uint64_t kResumedEnd = 2 * kDataRecordSize + kTrimRecordSize;
+  static constexpr uint64_t kResumedSeq = 4;
+
+  FaultIo io_;
+  LogFile log_{io_, kResumedEnd, kResumedSeq};
+};
+
+TEST_F(ResumedLogFileTest, EndAndNextSeqStartAtTheResumedValues) {
+  EXPECT_EQ(log_.end(), kResumedEnd);
+  EXPECT_EQ(log_.next_seq(), kResumedSeq);
+  EXPECT_FALSE(log_.broken());
+}
+
+TEST_F(ResumedLogFileTest, TheNextAppendLandsAtEndWithNextSeq) {
+  uint64_t offset = 0;
+  auto payload = payload_for(9);
+  ASSERT_TRUE(log_.append_data(9, payload, &offset).ok());
+  EXPECT_EQ(offset, kResumedEnd);
+  ASSERT_EQ(io_.bytes().size(), kResumedEnd + kDataRecordSize);
+
+  // Decode the new record straight from the file bytes and look at its header.
+  Record r{};
+  ASSERT_TRUE(decode_record(as_bytes(io_.bytes()).subspan(kResumedEnd), &r).ok());
+  EXPECT_EQ(r.header.seq, kResumedSeq);
+  EXPECT_EQ(r.header.block_no, 9U);
+
+  // end() and next_seq() advance from the resumed values, not from 0 and 1.
+  EXPECT_EQ(log_.end(), kResumedEnd + kDataRecordSize);
+  EXPECT_EQ(log_.next_seq(), kResumedSeq + 1);
+
+  ASSERT_TRUE(log_.append_trim(5, 2).ok());
+  ASSERT_TRUE(decode_record(as_bytes(io_.bytes()).subspan(kResumedEnd + kDataRecordSize), &r).ok());
+  EXPECT_EQ(r.header.type, RecordType::Trim);
+  EXPECT_EQ(r.header.seq, kResumedSeq + 1);
+  EXPECT_EQ(log_.end(), kResumedEnd + kDataRecordSize + kTrimRecordSize);
+  EXPECT_EQ(log_.next_seq(), kResumedSeq + 2);
+}
+
+TEST_F(ResumedLogFileTest, TheFirstAppendWritesAtTheResumedEndNotAtZero) {
+  io_.clear_calls();
+  uint64_t offset = 0;
+  auto payload = payload_for(9);
+  ASSERT_TRUE(log_.append_data(9, payload, &offset).ok());
+  ASSERT_EQ(io_.calls().size(), 1U);
+  EXPECT_EQ(io_.calls()[0].op, Op::Pwrite);
+  EXPECT_EQ(io_.calls()[0].offset, kResumedEnd);
+}
+
+TEST_F(ResumedLogFileTest, ReadRecordWorksOnRecordsBeforeEnd) {
+  std::array<uint8_t, kDataRecordSize> buffer{};
+  Record r{};
+  ASSERT_TRUE(log_.read_record(0, &buffer, &r).ok());
+  EXPECT_EQ(r.header.seq, 1U);
+  EXPECT_EQ(r.header.block_no, 1U);
+
+  ASSERT_TRUE(log_.read_record(kDataRecordSize, &buffer, &r).ok());
+  EXPECT_EQ(r.header.type, RecordType::Trim);
+  EXPECT_EQ(r.header.seq, 2U);
+
+  // The last record before end, a DATA record whose size equals the whole buffer.
+  ASSERT_TRUE(log_.read_record(kDataRecordSize + kTrimRecordSize, &buffer, &r).ok());
+  EXPECT_EQ(r.header.seq, 3U);
+  EXPECT_EQ(r.header.block_no, 3U);
+  auto want = payload_for(3);
+  EXPECT_EQ(Bytes(r.payload.begin(), r.payload.end()), Bytes(want.begin(), want.end()));
+}
+
+TEST_F(ResumedLogFileTest, ReadRecordAtOrPastEndIsCorrupt) {
+  std::array<uint8_t, kDataRecordSize> buffer{};
+  Record r{};
+  EXPECT_EQ(log_.read_record(kResumedEnd, &buffer, &r).code(), StatusCode::Corrupt);
+  EXPECT_EQ(log_.read_record(kResumedEnd + 1, &buffer, &r).code(), StatusCode::Corrupt);
+
+  // After an append, the new record is readable at the old end.
+  uint64_t offset = 0;
+  auto payload = payload_for(9);
+  ASSERT_TRUE(log_.append_data(9, payload, &offset).ok());
+  ASSERT_TRUE(log_.read_record(offset, &buffer, &r).ok());
+  EXPECT_EQ(r.header.seq, kResumedSeq);
+}
+
+TEST_F(ResumedLogFileTest, AFailedAppendIsCutBackToTheResumedEnd) {
+  io_.clear_calls();
+  io_.fail_next(Op::Pwrite, StatusCode::IoError, 1000);  // 1000 torn bytes reach the file
+
+  uint64_t offset = 777;
+  auto payload = payload_for(9);
+  EXPECT_EQ(log_.append_data(9, payload, &offset).code(), StatusCode::IoError);
+
+  // The cut goes to the resumed end, not to 0 and not to the torn end.
+  ASSERT_EQ(io_.count(Op::Ftruncate), 1U);
+  for (const auto& call : io_.calls()) {
+    if (call.op == Op::Ftruncate) {
+      EXPECT_EQ(call.length, kResumedEnd);
+    }
+  }
+  EXPECT_EQ(io_.bytes().size(), kResumedEnd);
+  EXPECT_EQ(log_.end(), kResumedEnd);
+  EXPECT_EQ(log_.next_seq(), kResumedSeq);
+  EXPECT_EQ(offset, 777U);
+  EXPECT_FALSE(log_.broken());
+
+  // The retry lands in the same place with the same seq.
+  ASSERT_TRUE(log_.append_data(9, payload, &offset).ok());
+  EXPECT_EQ(offset, kResumedEnd);
+  Record r{};
+  ASSERT_TRUE(decode_record(as_bytes(io_.bytes()).subspan(kResumedEnd), &r).ok());
+  EXPECT_EQ(r.header.seq, kResumedSeq);
+}
+
+TEST_F(ResumedLogFileTest, IfTheCutBackFailsTooTheLogIsBroken) {
+  io_.fail_next(Op::Pwrite, StatusCode::NoSpace, 1000);
+  io_.fail_next(Op::Ftruncate, StatusCode::IoError);
+  uint64_t offset = 0;
+  auto payload = payload_for(9);
+  EXPECT_EQ(log_.append_data(9, payload, &offset).code(), StatusCode::NoSpace);
+  EXPECT_TRUE(log_.broken());
+  EXPECT_EQ(log_.end(), kResumedEnd);
+  EXPECT_EQ(log_.next_seq(), kResumedSeq);
+}
+
+TEST(LogFileResumeTest, ResumingAtZeroWithSeqOneIsTheSameAsAPlainNewLog) {
+  FaultIo io;
+  ASSERT_TRUE(test::open_or_create_log(io, "fake.log").ok());
+  LogFile resumed(io, 0, 1);
+  EXPECT_EQ(resumed.end(), 0U);
+  EXPECT_EQ(resumed.next_seq(), 1U);
+  uint64_t offset = ~0ULL;
+  auto payload = payload_for(1);
+  ASSERT_TRUE(resumed.append_data(1, payload, &offset).ok());
+  EXPECT_EQ(offset, 0U);
+  EXPECT_EQ(scan(io.bytes()).size(), 1U);
 }
 
 }  // namespace

@@ -67,6 +67,33 @@ class Harness {
   [[nodiscard]] bool start(const std::vector<std::string>& settings,
                            const std::string& plugin = plugin_path());
 
+  // start() in two halves, so a test can launch several servers before waiting
+  // for any of them (a startup race). launch() forks nbdkit and returns at once;
+  // false only if fork failed. wait_until_serving() is the waiting half of
+  // start(): true when the socket exists, false if nbdkit exited first (or did
+  // not start in time).
+  [[nodiscard]] bool launch(const std::vector<std::string>& settings,
+                            const std::string& plugin = plugin_path());
+  [[nodiscard]] bool wait_until_serving();
+
+  // Background mode: runs nbdkit WITHOUT -f, so it forks into the background after
+  // get_ready and the process we started exits. The daemon's pid comes from
+  // `nbdkit -P <dir>/pid`. Returns true if the foreground process exited with
+  // status 0 and the pid file named a live process. On a refusal it returns false
+  // and the foreground process's stderr is in <dir>/stderr.txt. The daemon's own
+  // stderr goes nowhere (nbdkit closes it when it forks). The destructor kills the
+  // daemon if a test forgot to.
+  [[nodiscard]] bool start_background(const std::vector<std::string>& settings,
+                                      const std::string& plugin = plugin_path());
+  // The daemon's pid, or -1 before start_background() succeeded.
+  [[nodiscard]] pid_t background_pid() const { return daemon_pid_; }
+  // The pid of the process launch() or start_background() forked.
+  [[nodiscard]] pid_t launched_pid() const { return pid_; }
+  // SIGTERMs the daemon and waits until it is gone (it is not our child, so we
+  // poll kill(pid, 0)). Kills it with SIGKILL and records a failure if it does not
+  // go in a few seconds. Returns true if it stopped on SIGTERM.
+  bool stop_background();
+
   // Connects with libnbd over the Unix socket. Returns null and records a test
   // failure if it cannot. Libnbd's bounds check is switched off so that
   // out-of-range requests reach the server, which is what we want to test.
@@ -83,9 +110,14 @@ class Harness {
   // Collects the exit status if the child has ended. Never blocks.
   bool try_reap();
   void finish(int wait_status);
+  // Forks and execs nbdkit with `args` (args[0] is "nbdkit"); sets pid_.
+  bool spawn(std::vector<std::string> args);
+  // Waits until the daemon from start_background() is gone; false on timeout.
+  bool wait_daemon_gone();
 
   std::string dir_;
   pid_t pid_ = -1;
+  pid_t daemon_pid_ = -1;
   std::optional<ServerExit> exit_;
 };
 

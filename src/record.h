@@ -18,11 +18,11 @@ enum class RecordType : uint8_t { Data = 1, Trim = 2 };
 // reserved and the CRC are fixed by the format, so they are not stored here:
 // decoding checks them, and encoding writes them.
 struct RecordHeader {
-  RecordType type;
-  uint64_t seq;
-  uint64_t block_no;     // first logical block affected
-  uint32_t block_count;  // DATA: 1. TRIM: 1 or more
-  uint32_t data_len;     // DATA: 4096. TRIM: 0
+  RecordType type = RecordType::Data;
+  uint64_t seq = 0;
+  uint64_t block_no = 0;     // first logical block affected
+  uint32_t block_count = 0;  // DATA: 1. TRIM: 1 or more
+  uint32_t data_len = 0;     // DATA: 4096. TRIM: 0
 };
 
 // A fully validated record. `payload` points into the bytes that were decoded,

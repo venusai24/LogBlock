@@ -39,4 +39,15 @@ void BlockMap::clear_range(uint64_t first_block, uint64_t count) {
   std::fill_n(offsets_.begin() + static_cast<std::ptrdiff_t>(first_block), count, kUnmapped);
 }
 
+std::span<const uint64_t, kBlockCount> BlockMap::snapshot() const {
+  return std::span<const uint64_t, kBlockCount>(offsets_.data(), kBlockCount);
+}
+
+void BlockMap::load(std::span<const uint64_t, kBlockCount> entries) {
+  // Copy, not alias: the caller's buffer (e.g. a checkpoint read buffer) may be
+  // freed or reused. If `entries` is our own snapshot(), copying onto itself is
+  // harmless. The sentinel is allowed here: it is how unmapped blocks are saved.
+  std::ranges::copy(entries, offsets_.begin());
+}
+
 }  // namespace logblock

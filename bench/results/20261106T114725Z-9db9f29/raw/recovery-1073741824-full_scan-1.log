@@ -1,0 +1,2 @@
+[info] recovery log=/home/venusai/Dev/miniHCI/LogBlock/bench-data/logblock-bench.QC7hwH/log.bin source=full_scan slot=- generation=0 records_replayed=259608 log_bytes_scanned=1073738688 torn_bytes_removed=0 unreadable_checkpoints=0 time_us=393740
+[info] counters reads=0 writes=0 trims=0 flushes=0 bytes_logged=1073738688 checkpoints_written=0 checkpoints_failed=0 checkpoints_unreadable=0 checkpoint_duration_count=0 checkpoint_duration_max_us=0 checkpoint_duration_sum_us=0
